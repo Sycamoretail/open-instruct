@@ -541,6 +541,17 @@ class PolicyTrainerRayProcess(RayProcess):
             ray_get_with_progress(refs, desc="Initializing vLLM weight transfer engines", timeout=600)
         torch.distributed.barrier()
 
+    def warmup_for_weight_sync(self):
+        """Run a dummy forward so DeepSpeed Stage 3 materializes sharded params.
+
+        Without this, the first broadcast after ``deepspeed.initialize`` can send
+        uninitialized storage to vLLM -- producing NaN logprobs on the first rollout.
+        """
+        torch.cuda.set_device(self.local_rank)
+        input_ids = torch.tensor([[self.pad_token_id]], device=self.device, dtype=torch.long)
+        with torch.no_grad():
+            self.model(input_ids=input_ids)
+
     def broadcast_to_vllm(self, model_step: int):
         # avoid OOM
         torch.cuda.empty_cache()
@@ -1447,13 +1458,7 @@ def create_model_and_optimizer(
             "Restored data prep actor state from checkpoint "
             f"with training_step={data_prep_actor_state['training_step']}"
         )
-
     ray_get_with_progress([_data_prep_actor.start.remote()], desc="Starting data prep actor")
-
-    logger.info(
-        "======== ⏸️ lazily initializing native vLLM weight sync on the first required sync after step 1 ========="
-    )
-
     return (
         policy_group,
         vllm_engines,
@@ -2052,7 +2057,7 @@ def run_training(
             enable=False,
         )
 
-    def initialize_weight_sync() -> tuple[futures.Future, WeightSyncTrigger]:
+    def initialize_weight_sync(initial_step: int) -> tuple[futures.Future, WeightSyncTrigger]:
         logger.info("[Main Thread] Initializing native vLLM weight sync.")
 
         ray_get_with_progress(
@@ -2076,7 +2081,7 @@ def run_training(
             streaming_config.inflight_updates,
         )
 
-        logger.info("[Main Thread] Triggering initial native vLLM weight sync.")
+        logger.info(f"[Main Thread] Triggering initial native vLLM weight sync at step {initial_step}.")
         trigger.notify(step=initial_step)
         health_check_fn(future, expect_new_weight_sync=True)
         return future, trigger
@@ -2108,6 +2113,13 @@ def run_training(
         wandb_url=wandb_url,
     )
     last_eval_collected = True
+
+    ray_get_with_progress(
+        [m.warmup_for_weight_sync.remote() for m in policy_group.models],
+        desc="Warming up learner for first weight sync",
+    )
+    weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync(resume_training_step)
+
     for training_step in range(resume_training_step, args.num_training_steps + 1):
         start_time = time.perf_counter()
 
@@ -2201,9 +2213,7 @@ def run_training(
                 )
                 logger.info(f"Saved checkpoint state at step {training_step} to {args.checkpoint_state_dir}")
 
-        if training_step == 1:
-            weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
-        elif weight_sync_trigger is not None:
+        if training_step > resume_training_step:
             logger.debug(f"[Main Thread] Triggered weight sync for step {training_step}")
             weight_sync_trigger.notify(step=training_step)
 
