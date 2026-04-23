@@ -8,6 +8,7 @@ import gc
 import gzip
 import json
 import os
+import pathlib
 import shutil
 import tempfile
 import unittest
@@ -35,6 +36,108 @@ def _get_tokenizer_path():
 
 
 TOKENIZER_PATH = _get_tokenizer_path()
+
+
+class TestIncrementalCheckpoint(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.output_dir = pathlib.Path(self.tmp_dir.name)
+
+    def _scalar_state(self):
+        return {
+            "current_position": 0,
+            "num_samples_skipped": 0,
+            "per_dataset_counts": {},
+            "per_dataset_tokens": {},
+            "per_dataset_trainable_tokens": {},
+            "per_dataset_filtered": {},
+        }
+
+    def test_incremental_save_appends_only_new_data(self):
+        token_ids = [1, 2, 3]
+        labels_mask = [1, 0, 1]
+        document_boundaries = [(0, 3)]
+        tw1, sw1, _ = numpy_dataset_conversion.save_checkpoint(
+            self.output_dir,
+            samples_processed=1,
+            token_ids=token_ids,
+            labels_mask=labels_mask,
+            document_boundaries=document_boundaries,
+            scalar_state=self._scalar_state(),
+            prev_tokens_written=0,
+            prev_samples_written=0,
+        )
+
+        tokens_path = self.output_dir / "_checkpoint_token_ids.bin"
+        size_after_first = tokens_path.stat().st_size
+
+        token_ids.extend([4, 5, 6, 7])
+        labels_mask.extend([0, 0, 1, 1])
+        document_boundaries.append((3, 7))
+
+        tw2, sw2, _ = numpy_dataset_conversion.save_checkpoint(
+            self.output_dir,
+            samples_processed=2,
+            token_ids=token_ids,
+            labels_mask=labels_mask,
+            document_boundaries=document_boundaries,
+            scalar_state=self._scalar_state(),
+            prev_tokens_written=tw1,
+            prev_samples_written=sw1,
+        )
+        size_after_second = tokens_path.stat().st_size
+
+        self.assertEqual(tw2, 7)
+        self.assertEqual(sw2, 2)
+        self.assertEqual(size_after_second - size_after_first, 4 * np.dtype(np.uint32).itemsize)
+
+        loaded = numpy_dataset_conversion.load_checkpoint(self.output_dir)
+        self.assertEqual(loaded["token_ids"], token_ids)
+        self.assertEqual(loaded["labels_mask"], labels_mask)
+        self.assertEqual(loaded["document_boundaries"], document_boundaries)
+
+    def test_load_raises_on_truncated_binary(self):
+        token_ids = [1, 2, 3, 4, 5]
+        labels_mask = [1, 0, 1, 0, 1]
+        document_boundaries = [(0, 5)]
+        numpy_dataset_conversion.save_checkpoint(
+            self.output_dir,
+            samples_processed=1,
+            token_ids=token_ids,
+            labels_mask=labels_mask,
+            document_boundaries=document_boundaries,
+            scalar_state=self._scalar_state(),
+            prev_tokens_written=0,
+            prev_samples_written=0,
+        )
+
+        tokens_path = self.output_dir / "_checkpoint_token_ids.bin"
+        with open(tokens_path, "r+b") as f:
+            f.truncate(np.dtype(np.uint32).itemsize)
+
+        with self.assertRaises(RuntimeError):
+            numpy_dataset_conversion.load_checkpoint(self.output_dir)
+
+    def test_load_raises_on_missing_binary(self):
+        token_ids = [1, 2, 3]
+        labels_mask = [1, 0, 1]
+        document_boundaries = [(0, 3)]
+        numpy_dataset_conversion.save_checkpoint(
+            self.output_dir,
+            samples_processed=1,
+            token_ids=token_ids,
+            labels_mask=labels_mask,
+            document_boundaries=document_boundaries,
+            scalar_state=self._scalar_state(),
+            prev_tokens_written=0,
+            prev_samples_written=0,
+        )
+
+        (self.output_dir / "_checkpoint_token_ids.bin").unlink()
+
+        with self.assertRaises(RuntimeError):
+            numpy_dataset_conversion.load_checkpoint(self.output_dir)
 
 
 class TestWriteMemmapChunked(unittest.TestCase):
