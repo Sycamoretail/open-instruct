@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 
 ### Changed
+- Extract numpy SFT conversion helpers into `open_instruct.numpy_dataset_conversion` (https://github.com/allenai/open-instruct/pull/1622).
 - Simplified model step tracking logic (https://github.com/allenai/open-instruct/pull/1616).
 - Pass `attention_mask=None` in GRPO `forward_for_logprobs` calls — HF constructs the correct 3D intra-document mask from `position_ids` internally (https://github.com/allenai/open-instruct/pull/1617).
 - Migrate GRPO trainer→vLLM weight sync to vLLM 0.16.0's native weight transfer API (`NCCLWeightTransferEngine`), replacing custom NCCL process-group and broadcast code (https://github.com/allenai/open-instruct/pull/1515).
@@ -21,7 +22,6 @@ All notable changes to this project will be documented in this file.
 - Add deprecation warning to `finetune.py` pointing users to the OLMo-core SFT implementation (https://github.com/allenai/open-instruct/pull/1574).
 
 ### Fixed
-- Fix import error when installing as dependency (https://github.com/allenai/open-instruct/pull/1634)
 - Fix weight sync on resume by initializing vLLM weight sync before the training loop and warming up the learner with a dummy forward so DeepSpeed Stage 3 params materialize before the first broadcast; accept IPC `update_info` dict in `LLMRayActor.update_weights`; replace toothless weight-sync tests with a real divergent-weight broadcast test (https://github.com/allenai/open-instruct/pull/1627).
 - Fix `verify_sentence_constraint` not recognising `!` as a sentence terminator, causing IFEval sentence-count checks to undercount any response containing exclamations (https://github.com/allenai/open-instruct/pull/1612).
 - Fix `DataPreparationActor` hanging on shutdown by killing the actor with `ray.kill()` during cleanup (https://github.com/allenai/open-instruct/pull/1611).
