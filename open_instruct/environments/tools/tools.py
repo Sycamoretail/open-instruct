@@ -14,6 +14,12 @@ from open_instruct.environments.base import BaseEnvConfig, EnvCall, StepResult
 from open_instruct.environments.examples import CounterEnvConfig, GuessNumberEnvConfig, WordleTextEnvConfig
 from open_instruct.environments.generic_sandbox import GenericSandboxEnvConfig
 from open_instruct.environments.tools.generic_mcp import GenericMCPToolConfig
+from open_instruct.environments.tools.scholar_tools import (
+    FetchToolConfig,
+    GeneralSearchToolConfig,
+    MockScholarSearchToolConfig,
+    ScholarSearchToolConfig,
+)
 from open_instruct.environments.tools.utils import Tool, coerce_args, log_env_call, make_api_request
 
 logger = logger_utils.setup_logger(__name__)
@@ -659,4 +665,9 @@ TOOL_REGISTRY: dict[str, type[BaseEnvConfig]] = {
     GuessNumberEnvConfig.tool_class.config_name: GuessNumberEnvConfig,
     GenericSandboxEnvConfig.tool_class.config_name: GenericSandboxEnvConfig,
     WordleTextEnvConfig.tool_class.config_name: WordleTextEnvConfig,
+    # Scholar-agent bundle (internal: ScholarSearch/GeneralSearch/Fetch; mock: deterministic fake)
+    ScholarSearchToolConfig.tool_class.config_name: ScholarSearchToolConfig,
+    GeneralSearchToolConfig.tool_class.config_name: GeneralSearchToolConfig,
+    FetchToolConfig.tool_class.config_name: FetchToolConfig,
+    MockScholarSearchToolConfig.tool_class.config_name: MockScholarSearchToolConfig,
 }

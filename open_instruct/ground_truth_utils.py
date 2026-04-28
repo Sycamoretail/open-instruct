@@ -1192,6 +1192,10 @@ def build_all_verifiers(args, streaming_config=None) -> dict[str, VerifierFuncti
         args: The main Args object
         streaming_config: Optional StreamingDataLoaderConfig for additional fields
     """
+    # Import project-local verifier modules so their subclasses show up in
+    # ``VerifierFunction.__subclasses__()`` below.
+    from open_instruct import scholar_verifier  # noqa: F401
+
     verifiers: dict[str, VerifierFunction] = {}
     for subclass in VerifierFunction.__subclasses__():
         if subclass == LMJudgeVerifier:
