@@ -24,20 +24,21 @@ protocol on the wire is:
 
     <call_tool name="ScholarSearch">retrieval augmented generation</call_tool>
 
-and the env will write back ``<tool_output>...</tool_output>`` messages
+and the env will write back ``<tool_response>...</tool_response>`` messages
 into the conversation.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import time
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from open_instruct import logger_utils
 from open_instruct.environments.base import BaseEnvConfig, EnvCall, StepResult
-from open_instruct.environments.tools.utils import Tool, coerce_args, log_env_call
+from open_instruct.environments.tools.utils import Tool, coerce_args, get_openai_tool_definitions, log_env_call
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -48,9 +49,8 @@ _REGISTRY_CACHE: dict[str, Any] = {}
 def _get_registry(backend: str):
     """Build (once) and return the ``tools.ToolRegistry`` for the backend."""
     if backend not in _REGISTRY_CACHE:
-        from tools import build_default_registry
-
-        _REGISTRY_CACHE[backend] = build_default_registry(backend)
+        tools_module = importlib.import_module("tools")
+        _REGISTRY_CACHE[backend] = tools_module.build_default_registry(backend)
     return _REGISTRY_CACHE[backend]
 
 
@@ -73,14 +73,48 @@ class _ScholarToolBase(Tool):
     backend: ClassVar[str] = "internal"
     internal_name: ClassVar[str] = ""
 
+    async def reset(self, **kwargs: Any) -> tuple[StepResult, list[dict]]:
+        """Per-rollout reset that wires per-sample ``last_time`` / ``curr_title``.
+
+        The internal ``tools`` package keeps a module-level ``_INTERNAL_STATE``
+        that scholar / general search read from to:
+          * filter results by ``last_time`` (a cutoff publication date), and
+          * avoid leaking the target paper back via ``curr_title``.
+
+        The training pipeline delivers these fields through the canonical
+        per-sample ``env_config`` channel:
+
+            sample["env_config"] -> _merge_env_config ->
+            EnvConfigEntry.kwargs -> actor.reset.remote(**kwargs)
+
+        So any kwargs (e.g. ``last_time``, ``curr_title``) forwarded into
+        ``reset`` should update the internal state for this rollout.
+
+        Kwargs that are not understood are simply ignored; this keeps the
+        reset contract compatible with the default ``Tool.reset``.
+        """
+        tools_module = importlib.import_module("tools")
+        reset_fn = getattr(tools_module, "_reset_internal_state", None)
+        if reset_fn is not None:
+            last_time = kwargs.get("last_time")
+            curr_title = kwargs.get("curr_title")
+            try:
+                reset_fn(last_time=last_time, curr_title=curr_title)
+            except Exception as e:
+                logger.warning(
+                    "scholar_tools._reset_internal_state failed (last_time=%r, curr_title=%r): %s",
+                    last_time,
+                    curr_title,
+                    e,
+                )
+        return StepResult(result=""), [get_openai_tool_definitions(self)]
+
     async def step(self, call: EnvCall) -> StepResult:
         args = coerce_args(self.parameters, call.args)
         start = time.time()
 
         loop = asyncio.get_event_loop()
-        ok, content = await loop.run_in_executor(
-            None, _call_internal, self.backend, self.internal_name, args
-        )
+        ok, content = await loop.run_in_executor(None, _call_internal, self.backend, self.internal_name, args)
         metadata = {"error": "" if ok else content, "runtime": time.time() - start}
         result = StepResult(result=content if ok else "", metadata=metadata)
         log_env_call(self.call_name, str(args)[:400], result)
@@ -99,7 +133,7 @@ class ScholarSearchTool(_ScholarToolBase):
     description = (
         "Academic search over the internal scholar corpus. "
         "Inner text is a natural-language query. Returns an XML snippet of "
-        "<document reference_id=\"<|superscript|>:N\"> blocks."
+        '<document reference_id="<|superscript|>:N"> blocks.'
     )
     parameters = {
         "type": "object",
@@ -121,7 +155,7 @@ class GeneralSearchTool(_ScholarToolBase):
     call_name = "GeneralSearch"
     description = (
         "General-purpose web search. Inner text is a query. Returns an XML "
-        "snippet of <document reference_id=\"<|superscript|>:N\"> blocks."
+        'snippet of <document reference_id="<|superscript|>:N"> blocks.'
     )
     parameters = {
         "type": "object",

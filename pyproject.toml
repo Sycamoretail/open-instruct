@@ -45,6 +45,7 @@ dependencies = [
     "openenv-core>=0.2.1",
     "docker>=7.0.0",
     "flash-linear-attention>=0.4.2",
+    "tenacity>=9.1.2",
 ]
 
 [build-system]
@@ -94,8 +95,10 @@ code = [
     "requests>=2.28.0",
 ]
 dr-tulu = [
-    "dr_agent",
-    "authlib",
+    "jinja2>=3.1.0",
+    "pandas>=2.2.0",
+    "python-dotenv>=1.0.1",
+    "retry>=0.9.2",
     "scipy",
 ]
 

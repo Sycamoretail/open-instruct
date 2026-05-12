@@ -25,20 +25,36 @@ import re
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-from .config import (
-    ANSWER_CLOSE,
-    CALL_TOOL_CLOSE,
-    CALL_TOOL_OPEN_PREFIX,
-    CALL_TOOL_RE,
-    CITE_RE,
-    TOOL_CALL_CLOSE,
-    TOOL_CALL_OPEN,
-    TOOL_RESP_CLOSE,
-    TOOL_RESP_OPEN,
-)
+import inspect
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ReAct / XML protocol tokens and regexes.
+# Keep these local so the tools package is self-contained and does not rely on
+# a partially ported `tools.config`.
+# ---------------------------------------------------------------------------
+
+TOOL_CALL_OPEN = "<call_tool"
+TOOL_CALL_CLOSE = "</call_tool>"
+CALL_TOOL_OPEN_PREFIX = TOOL_CALL_OPEN
+CALL_TOOL_CLOSE = TOOL_CALL_CLOSE
+
+TOOL_RESP_OPEN = "<tool_response>"
+TOOL_RESP_CLOSE = "</tool_response>"
+
+ANSWER_OPEN = "<answer>"
+ANSWER_CLOSE = "</answer>"
+
+CALL_TOOL_RE = re.compile(
+    re.escape(TOOL_CALL_OPEN) + r"([^>]*)>(.*?)" + re.escape(TOOL_CALL_CLOSE),
+    re.DOTALL,
+)
+
+CITE_RE = re.compile(
+    r"<cite\s+id\s*=\s*\"([^\"]+)\"\s*>(.*?)</cite>",
+    re.DOTALL,
+)
 
 
 def _shorten_text(text: str, limit: int = 240) -> str:
@@ -324,7 +340,35 @@ class ToolRegistry:
             _shorten_text(json.dumps(kwargs, ensure_ascii=False, default=str), limit=320),
         )
         try:
-            out = meta["fn"](**kwargs)
+            fn = meta["fn"]
+            sig = inspect.signature(fn)
+            params = sig.parameters
+
+            # 若函数声明了 **kwargs，则无需过滤
+            has_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+
+            if has_var_kwargs:
+                filtered_kwargs = kwargs
+            else:
+                # 仅保留函数显式接受的关键字参数
+                accepted_names = {
+                    name
+                    for name, p in params.items()
+                    if p.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                }
+                filtered_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k in accepted_names
+                }
+
+            out = fn(**filtered_kwargs)
             out_str = str(out)[:4096]
             logger.info(
                 "[tool_registry][rank=%s] execute_done tool=%s ok=true elapsed=%.3fs "

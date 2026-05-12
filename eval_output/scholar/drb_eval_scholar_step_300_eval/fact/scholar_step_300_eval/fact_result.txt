@@ -1,0 +1,3 @@
+avg_citations_per_article: 4.1667
+avg_valid_citations_per_article: 0.3333
+valid_rate: 0.0800

@@ -276,7 +276,11 @@ class TestDRTuluToolParser(unittest.TestCase):
         parser = DRTuluToolParser([self.DR_AGENT_DEF], stop_sequences=["</call_tool>"])
 
         result = parser.format_tool_outputs(["Search result: Found 5 items"])
-        expected = "<tool_output>\nSearch result: Found 5 items\n</tool_output>\n"
+        expected = (
+            "<|im_end|>\n"
+            "<|im_start|>user\n<tool_response>\nSearch result: Found 5 items\n</tool_response>\n<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
         self.assertEqual(result, expected)
 
     def test_format_tool_outputs_multiple(self):
@@ -284,14 +288,19 @@ class TestDRTuluToolParser(unittest.TestCase):
         parser = DRTuluToolParser([self.DR_AGENT_DEF], stop_sequences=["</call_tool>"])
 
         result = parser.format_tool_outputs(["Result 1", "Result 2"])
-        expected = "<tool_output>\nResult 1\n</tool_output>\n\n<tool_output>\nResult 2\n</tool_output>\n"
+        expected = (
+            "<|im_end|>\n"
+            "<|im_start|>user\n<tool_response>\nResult 1\n</tool_response>\n<|im_end|>\n"
+            "<|im_start|>user\n<tool_response>\nResult 2\n</tool_response>\n<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
         self.assertEqual(result, expected)
 
     def test_stop_sequences_empty(self):
-        """Test that empty list is used when no stop sequences provided."""
+        """Test that parser defaults to the canonical DR Tulu stop string."""
         parser = DRTuluToolParser([self.DR_AGENT_DEF], stop_sequences=[])
 
-        self.assertEqual(parser.stop_sequences, [])
+        self.assertEqual(parser.stop_sequences, ["</call_tool>"])
 
     def test_stop_sequences_from_init(self):
         """Test that stop sequences are set from init parameter."""
@@ -306,12 +315,12 @@ class TestDRTuluToolParser(unittest.TestCase):
         self.assertEqual(parser.stop_sequences, ["</call_tool>", "</tool>"])
 
     def test_rejects_multiple_tools(self):
-        """Test that parser rejects multiple tools."""
+        """Test that parser supports generic routing with multiple tools."""
         defs = [self.DR_AGENT_DEF, make_tool_definition("other_tool")]
-
-        with self.assertRaises(ValueError) as context:
-            DRTuluToolParser(defs, stop_sequences=["</call_tool>"])
-        self.assertIn("exactly one tool", str(context.exception))
+        parser = DRTuluToolParser(defs, stop_sequences=["</call_tool>"])
+        tool_calls = parser.get_tool_calls('<call_tool name="other_tool">hello</call_tool>')
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "other_tool")
 
     def test_uses_tool_call_name(self):
         """Test that parser uses the tool's call name for routing."""
@@ -326,10 +335,30 @@ class TestDRTuluToolParser(unittest.TestCase):
     def test_rejects_wrong_tool(self):
         """Test that parser rejects tools that aren't dr_agent_mcp."""
         defs = [make_tool_definition("python")]
+        parser = DRTuluToolParser(defs, stop_sequences=["</call_tool>"])
+        self.assertEqual(parser.get_tool_calls('<call_tool name="python">print(1)</call_tool>')[0].name, "python")
 
-        with self.assertRaises(ValueError) as context:
-            DRTuluToolParser(defs, stop_sequences=["</code>"])
-        self.assertIn("dr_agent_mcp", str(context.exception))
+    def test_routes_multiple_tools_by_name_attribute(self):
+        """Test generic <call_tool name=...> routing across multiple tools."""
+        defs = [
+            make_tool_definition("ScholarSearch", param_name="query"),
+            make_tool_definition("Fetch", param_name="url"),
+        ]
+        parser = DRTuluToolParser(defs, stop_sequences=["</call_tool>"])
+
+        text = (
+            '<call_tool name="ScholarSearch" top_k="5">graph neural networks</call_tool>\n'
+            '<call_tool name="Fetch" description="abstract only">https://example.com/paper</call_tool>'
+        )
+        tool_calls = parser.get_tool_calls(text)
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0].name, "ScholarSearch")
+        self.assertEqual(tool_calls[0].args["query"], "graph neural networks")
+        self.assertEqual(tool_calls[0].args["top_k"], "5")
+        self.assertEqual(tool_calls[1].name, "Fetch")
+        self.assertEqual(tool_calls[1].args["url"], "https://example.com/paper")
+        self.assertEqual(tool_calls[1].args["description"], "abstract only")
 
 
 class TestGetAvailableParsers(unittest.TestCase):

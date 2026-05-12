@@ -9,6 +9,7 @@ import ast
 import asyncio
 import copy
 import dataclasses
+import importlib
 import json
 import logging
 import os
@@ -98,6 +99,7 @@ class VerificationResult:
     score: float
     cost: float = 0.0
     reasoning: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass
@@ -1194,7 +1196,7 @@ def build_all_verifiers(args, streaming_config=None) -> dict[str, VerifierFuncti
     """
     # Import project-local verifier modules so their subclasses show up in
     # ``VerifierFunction.__subclasses__()`` below.
-    from open_instruct import scholar_verifier  # noqa: F401
+    importlib.import_module("open_instruct.scholar_verifier")
 
     verifiers: dict[str, VerifierFunction] = {}
     for subclass in VerifierFunction.__subclasses__():
@@ -1257,7 +1259,7 @@ async def apply_verifiable_reward(
     reward_mult: float = 1.0,
     queries: list[str] | None = None,
     rollout_states: list[dict | None] | None = None,
-):
+) -> tuple[list[float], list[dict[str, float]], dict[str, list[float]], dict[str, dict[str, list[float]]]]:
     if queries is None:
         queries = [None] * len(responses)
     if rollout_states is None:
@@ -1297,6 +1299,8 @@ async def apply_verifiable_reward(
 
     response_rewards = [0] * len(responses)
     response_per_func_rewards = [{} for _ in range(len(responses))]
+    metric_values: dict[str, list[float]] = defaultdict(list)
+    per_func_metric_values: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 
     for result, metadata in zip(reward_results, task_metadata):
         response_idx = metadata["response_idx"]
@@ -1311,7 +1315,28 @@ async def apply_verifiable_reward(
             response_per_func_rewards[response_idx].get(dataset, 0) + weighted_reward
         )
 
-    return response_rewards, response_per_func_rewards
+        raw_metrics = getattr(result, "metadata", None)
+        if not isinstance(raw_metrics, dict):
+            continue
+
+        for key, value in raw_metrics.items():
+            if isinstance(value, bool | int | float | np.integer | np.floating):
+                metric_value = float(value)
+            else:
+                continue
+
+            if not np.isfinite(metric_value):
+                continue
+
+            metric_values[key].append(metric_value)
+            per_func_metric_values[dataset][key].append(metric_value)
+
+    return (
+        response_rewards,
+        response_per_func_rewards,
+        dict(metric_values),
+        {key: dict(value) for key, value in per_func_metric_values.items()},
+    )
 
 
 @dataclasses.dataclass
@@ -1367,7 +1392,12 @@ class RewardConfig:
                 metrics["val/format_scores"] = np.array(format_scores).mean()
 
             if self.apply_verifiable_reward:
-                verifiable_rewards, per_func_rewards = await apply_verifiable_reward(
+                (
+                    verifiable_rewards,
+                    per_func_rewards,
+                    verifier_metric_values,
+                    per_func_metric_values,
+                ) = await apply_verifiable_reward(
                     self.verifier_functions,
                     responses,
                     decoded_responses,
@@ -1410,6 +1440,11 @@ class RewardConfig:
                     np_value = np.array(value)
                     metrics[f"objective/{key}_reward"] = np_value.mean()
                     metrics[f"objective/{key}_correct_rate"] = (np_value > 0.0).mean()
+                for key, value in verifier_metric_values.items():
+                    metrics[f"objective/{key}"] = np.array(value).mean()
+                for func_name, func_metric_values in per_func_metric_values.items():
+                    for metric_name, values in func_metric_values.items():
+                        metrics[f"objective/{func_name}_{metric_name}"] = np.array(values).mean()
 
             if self.non_stop_penalty:
                 assert len(finish_reasons) == len(scores)

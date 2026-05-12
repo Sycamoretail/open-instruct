@@ -1574,9 +1574,29 @@ class RayProcess:
 
     @staticmethod
     def get_current_node_ip():
-        address = ray._private.services.get_node_ip_address()
-        # strip ipv6 address
-        return address.strip("[]")
+        # Allow explicit override for environments where Ray resolves an IPv6
+        # address but downstream NCCL/vLLM code expects an IPv4 bind target.
+        for env_name in ("OPEN_INSTRUCT_HOST_IP", "VLLM_HOST_IP", "MASTER_ADDR"):
+            value = os.environ.get(env_name)
+            if value:
+                return value.strip("[]")
+
+        address = ray._private.services.get_node_ip_address().strip("[]")
+        if ":" not in address:
+            return address
+
+        # Try to discover a non-loopback IPv4 address from local interfaces.
+        try:
+            for family, _, _, _, sockaddr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                if family == socket.AF_INET:
+                    ipv4 = sockaddr[0]
+                    if ipv4 and not ipv4.startswith("127."):
+                        return ipv4
+        except socket.gaierror:
+            pass
+
+        # Single-node local runs can safely use loopback when only IPv6 is visible.
+        return "127.0.0.1"
 
     def get_master_addr_port(self):
         return self.master_addr, self.master_port
@@ -1813,6 +1833,7 @@ GPU_SPECS = {
     "b200": {"flops": 2250e12, "memory_size": 192e9, "memory_bandwidth": 8e12},  # 8 TB/s HBM3e
     "h100": {"flops": 990e12, "memory_size": 80e9, "memory_bandwidth": 3.35e12},  # 3.35 TB/s HBM3
     "h200": {"flops": 989e12, "memory_size": 141e9, "memory_bandwidth": 4.8e12},  # 4.8 TB/s HBM3e
+    "h20": {"flops": 296e12, "memory_size": 96e9, "memory_bandwidth": 4.0e12},  # 96 GB HBM3, ~4.0 TB/s
     "a6000": {"flops": 155e12, "memory_size": 48e9, "memory_bandwidth": 768e9},  # 768 GB/s GDDR6
     "l40s": {"flops": 362e12, "memory_size": 48e9, "memory_bandwidth": 864e9},  # 864 GB/s GDDR6
     "pro 6000": {"flops": 503.8e12, "memory_size": 96e9, "memory_bandwidth": 1792e9},  # 1792 GB/s GDDR7

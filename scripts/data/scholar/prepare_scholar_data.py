@@ -30,7 +30,6 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
 # ---------------------------------------------------------------------------
 # System prompt (matches the action space from the figure in the user msg).
 # ---------------------------------------------------------------------------
@@ -99,6 +98,11 @@ Output format rules:
   - Inside <answer>, back every factual claim with <cite id="N"></cite>
     where N is a reference_id returned by one of your tool calls. Do not
     invent reference IDs.
+  - Do NOT use plain-text citation styles such as [1], [1][2], (1),
+    superscripts, footnotes, or a bibliography section.
+  - Put citations directly in XML form after the supported claim, e.g.
+    ... sentence.<cite id="3"></cite> or
+    ... sentence.<cite id="3"></cite><cite id="7"></cite>
 """
 
 
@@ -138,7 +142,70 @@ def _extract_ground_truth(extra_info: dict[str, Any]) -> str:
     return str(gt)
 
 
-def convert_file(src: str, dst: str, system_prompt: str) -> None:
+# Env names whose kwargs feed ``tools._reset_internal_state``. Keep these in
+# sync with the ``config_name`` of each ``_ScholarToolBase`` subclass in
+# ``open_instruct/environments/tools/scholar_tools.py``.
+_INTERNAL_ENV_NAMES_FOR_STATE: tuple[str, ...] = ("scholar_search", "general_search", "fetch")
+_MOCK_ENV_NAMES_FOR_STATE: tuple[str, ...] = ("mock_scholar_search",)
+
+
+def _extract_verifiable_meta(ground_truth_str: str) -> dict[str, Any]:
+    """Parse the per-sample ``ground_truth`` JSON and return ``verifiable_meta``.
+
+    Returns an empty dict on any decode / shape failure so callers can
+    always do ``.get(...)``.
+    """
+    if not ground_truth_str:
+        return {}
+    try:
+        gt = json.loads(ground_truth_str)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(gt, dict):
+        return {}
+    vm = gt.get("verifiable_meta")
+    if not isinstance(vm, dict):
+        return {}
+    return vm
+
+
+def _build_env_config(ground_truth_str: str, env_names: tuple[str, ...]) -> dict[str, Any] | None:
+    """Build the per-sample ``env_config`` payload that wires ``last_time``
+    and ``curr_title`` into :func:`tools._reset_internal_state` during RL
+    rollouts.
+
+    * ``last_time``  <- ``verifiable_meta["published_date"]``
+    * ``curr_title`` <- ``verifiable_meta["paper_title"]``
+
+    The canonical shape accepted by
+    ``open_instruct/data_loader.py::_merge_env_config`` is::
+
+        {"env_configs": [{"env_name": "scholar_search", "last_time": ..., "curr_title": ...}, ...]}
+
+    The same kwargs are replicated across the active scholar-related env
+    names for this backend.
+
+    Keep the same keys in every entry even when a field is missing. Hugging
+    Face ``datasets`` infers nested struct schemas per parquet; omitting
+    ``last_time`` for some task files makes later concatenation fail.
+    """
+    vm = _extract_verifiable_meta(ground_truth_str)
+    published_date = vm.get("published_date")
+    paper_title = vm.get("paper_title")
+
+    last_time = str(published_date).strip() if published_date not in (None, "") else ""
+    curr_title = str(paper_title).strip() if paper_title not in (None, "") else ""
+    if not last_time and not curr_title:
+        return None
+
+    env_configs: list[dict[str, Any]] = []
+    for env_name in env_names:
+        entry: dict[str, Any] = {"env_name": env_name, "last_time": last_time, "curr_title": curr_title}
+        env_configs.append(entry)
+    return {"env_configs": env_configs}
+
+
+def convert_file(src: str, dst: str, system_prompt: str, env_names: tuple[str, ...]) -> None:
     table = pq.read_table(src)
     rows = table.to_pylist()
 
@@ -150,17 +217,13 @@ def convert_file(src: str, dst: str, system_prompt: str) -> None:
         if not user_query:
             skipped += 1
             continue
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query},
-        ]
-        out_rows.append(
-            {
-                "messages": messages,
-                "ground_truth": _extract_ground_truth(row.get("extra_info") or {}),
-                "dataset": dataset,
-            }
-        )
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
+        ground_truth = _extract_ground_truth(row.get("extra_info") or {})
+        out_row: dict[str, Any] = {"messages": messages, "ground_truth": ground_truth, "dataset": dataset}
+        env_config = _build_env_config(ground_truth, env_names)
+        if env_config is not None:
+            out_row["env_config"] = env_config
+        out_rows.append(out_row)
 
     out_table = pa.Table.from_pylist(out_rows)
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
@@ -179,9 +242,7 @@ def main() -> None:
         help="Which tools the system prompt should advertise. Should match --tools in the training script.",
     )
     parser.add_argument(
-        "--print_prompt",
-        action="store_true",
-        help="Print the assembled system prompt and exit without writing files.",
+        "--print_prompt", action="store_true", help="Print the assembled system prompt and exit without writing files."
     )
     args = parser.parse_args()
 
@@ -190,12 +251,13 @@ def main() -> None:
         print(textwrap.dedent(system_prompt))
         return
 
+    env_names = _MOCK_ENV_NAMES_FOR_STATE if args.tool_backend == "mock" else _INTERNAL_ENV_NAMES_FOR_STATE
     for name in sorted(os.listdir(args.input_dir)):
         if not name.endswith(".parquet"):
             continue
         src = os.path.join(args.input_dir, name)
         dst = os.path.join(args.output_dir, name)
-        convert_file(src, dst, system_prompt)
+        convert_file(src, dst, system_prompt, env_names)
 
 
 if __name__ == "__main__":

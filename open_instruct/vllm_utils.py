@@ -18,6 +18,7 @@
 import argparse
 import asyncio
 import dataclasses
+import json
 import os
 import queue
 import sys
@@ -31,6 +32,7 @@ from typing import Any
 import aiohttp
 import backoff
 import deepspeed
+import httpx
 import openai
 import ray
 import torch
@@ -69,6 +71,44 @@ from open_instruct.ground_truth_utils import RewardConfig
 
 logger = logger_utils.setup_logger(__name__)
 
+
+# #region debug-point helper:rl-rollout-stall
+def _debug_write_raw(msg: str) -> None:
+    try:
+        os.makedirs(".dbg", exist_ok=True)
+        with open(".dbg/rl-rollout-stall-raw.log", "a") as f:
+            f.write(f"{int(time.time() * 1000)} {msg}\n")
+    except Exception:
+        pass
+
+
+def _debug_report(hypothesis_id: str, location: str, msg: str, data: dict[str, Any] | None = None) -> None:
+    try:
+        env_path = ".dbg/rl-rollout-stall.env"
+        session_id = "rl-rollout-stall"
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("DEBUG_SESSION_ID="):
+                        session_id = line.split("=", 1)[1].strip()
+        payload = {
+            "sessionId": session_id,
+            "runId": "pre",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": f"[DEBUG] {msg}",
+            "data": data or {},
+            "ts": int(time.time() * 1000),
+        }
+        os.makedirs(".dbg", exist_ok=True)
+        with open(".dbg/rl-rollout-stall-local.ndjson", "a") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# #endregion
+
 # ---------------------------------------------------------------------------
 # Monkey-patch: vLLM 0.18.0 hybrid model dtype serialization bug
 #
@@ -95,6 +135,19 @@ DRAIN_ACTIVE_TASKS_SLEEP_S = 1
 SHOULD_STOP_TIMEOUT_S = 0.1
 INFERENCE_INIT_TIMEOUT_S = 1200
 VLLM_HEALTH_CHECK_TIMEOUT_S = 600.0
+FORCE_FINAL_ANSWER_PROMPT = (
+    "You have reached the maximum number of allowed tool calls. "
+    "Do not call any tools again. Based only on the evidence already returned above, "
+    "write the final answer now. Your response MUST contain exactly one "
+    "<think>...</think> block followed by exactly one <answer>...</answer> block. "
+    'Inside <answer>, cite supporting evidence with <cite id="SOURCE_ID"></cite> '
+    "using only source IDs that appeared in the previous tool responses. "
+    "Do NOT use bracket citations like [1], [1][2], superscripts, footnotes, or a References section. "
+    "Every factual sentence in <answer> must end with one or more empty citation tags such as "
+    '<cite id="12"></cite> or <cite id="12"></cite><cite id="18"></cite>. '
+    "The citation tag itself must stay exactly in XML form; do not replace it with plain-text numbers. "
+    "If the evidence is incomplete, state the uncertainty instead of searching again."
+)
 
 
 def model_dims_from_vllm_config(vllm_config: "vllm.config.VllmConfig") -> utils.ModelDims:
@@ -201,6 +254,69 @@ def process_tool_tokens(
     masks = [0 if mask_tool_use else 1] * len(tokens)
 
     return tokens, logprobs, masks, excess
+
+
+def process_force_answer_prompt_tokens(
+    prompt: str, tokenizer, current_prompt_len: int, current_response_len: int, max_model_len: int, max_tokens: int
+) -> tuple[list[int], list[float], list[int]]:
+    """Tokenize a no-loss instruction that forces the final answer turn."""
+    try:
+        tokens = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt.strip()}], tokenize=True, add_generation_prompt=True
+        )
+    except (AttributeError, TypeError, ValueError):
+        try:
+            tokens = tokenizer.encode(f"\n\n{prompt.strip()}\n\n", add_special_tokens=False)
+        except TypeError:
+            logger.warning("tokenizer.encode failed on force-answer prompt (len=%d), using empty tokens", len(prompt))
+            tokens = []
+
+    # Some tokenizers return a BatchEncoding/dict-like object here rather than a raw list.
+    # Pull out `input_ids` explicitly so we do not accidentally turn the mapping keys
+    # like "input_ids" / "attention_mask" into prompt tokens.
+    if hasattr(tokens, "get"):
+        input_ids = tokens.get("input_ids")
+        if input_ids is not None:
+            tokens = input_ids
+
+    if hasattr(tokens, "tolist") and not isinstance(tokens, list):
+        try:
+            tokens = tokens.tolist()
+        except TypeError:
+            logger.warning("force-answer prompt tokenization could not convert tensor-like tokens to list")
+            tokens = []
+
+    if not isinstance(tokens, list):
+        try:
+            tokens = list(tokens)
+        except TypeError:
+            logger.warning("force-answer prompt tokenization returned non-list tokens, using empty tokens")
+            tokens = []
+
+    if tokens and isinstance(tokens[0], list):
+        tokens = tokens[0]
+
+    # Reserve at least one token for the actual forced model response.
+    room = max(0, max_model_len - current_prompt_len - 1)
+    budget = max(0, max_tokens - current_response_len - 1)
+    tokens = tokens[: min(room, budget)]
+    return tokens, [0.0] * len(tokens), [0] * len(tokens)
+
+
+def output_has_raw_tool_call(text: str) -> bool:
+    return "<call_tool" in text and "</call_tool>" in text
+
+
+def force_answer_sampling_params(sampling_params: SamplingConfig, max_tokens: int) -> dict[str, Any]:
+    current_sampling_params = dataclasses.replace(sampling_params, max_tokens=max_tokens)
+    params_dict = dataclasses.asdict(current_sampling_params)
+    min_tokens = params_dict.pop("min_tokens", 0)
+
+    stops = params_dict.get("stop")
+    if stops:
+        filtered_stops = [stop for stop in stops if stop != "</call_tool>"]
+        params_dict["stop"] = filtered_stops or None
+    return params_dict | {"min_tokens": min_tokens}
 
 
 def assert_threaded_actor(instance):
@@ -427,7 +543,30 @@ def _prefetch_worker(actor: "LLMRayActor") -> None:
             time.sleep(DRAIN_ACTIVE_TASKS_SLEEP_S)
             continue
 
+        # #region debug-point H1:prompt-queue-get
+        _debug_report(
+            "H1",
+            "vllm_utils._prefetch_worker",
+            "waiting for prompt_queue.get",
+            {"active_tasks": len(actor.active_tasks), "inference_batch_size": actor.inference_batch_size},
+        )
+        # #endregion
         request = actor.prompt_queue.get()
+        # #region debug-point H1:prompt-received
+        _debug_report(
+            "H1",
+            "vllm_utils._prefetch_worker",
+            "received prompt request",
+            {
+                "index": request.index,
+                "prompt_id": request.prompt_id,
+                "prompt_len": len(request.prompt),
+                "n": request.generation_config.n,
+                "max_tokens": request.generation_config.max_tokens,
+                "active_tools": request.active_tools,
+            },
+        )
+        # #endregion
         add_request(actor, request)
 
 
@@ -453,6 +592,14 @@ def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
         seed = request.generation_config.seed + j if request.generation_config.seed is not None else None
         sub_sampling_params = dataclasses.replace(sampling_params, seed=seed)
         sub_request_id = f"{request_id}_{j}"
+        # #region debug-point H1:subrequest-scheduled
+        _debug_report(
+            "H1",
+            "vllm_utils.add_request",
+            "scheduled subrequest",
+            {"base_request_id": request_id, "sub_request_id": sub_request_id, "seed": seed},
+        )
+        # #endregion
         actor.active_tasks[sub_request_id] = asyncio.run_coroutine_threadsafe(
             process_request(actor, sub_request_id, sub_sampling_params), actor.loop
         )
@@ -514,9 +661,38 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
     actor.request_outputs.pop(base_request_id)
     actor.request_metadata.pop(base_request_id, None)
 
+    # #region debug-point H4:reward-start
+    _debug_report(
+        "H4",
+        "vllm_utils.finalize_completed_request",
+        "starting reward computation",
+        {"base_request_id": base_request_id, "is_eval": is_eval, "num_responses": len(result.responses)},
+    )
+    # #endregion
     result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
+    # #region debug-point H4:reward-end
+    _debug_report(
+        "H4",
+        "vllm_utils.finalize_completed_request",
+        "finished reward computation",
+        {
+            "base_request_id": base_request_id,
+            "is_eval": is_eval,
+            "scores": result.reward_scores,
+            "metric_keys": sorted((result.reward_metrics or {}).keys()),
+        },
+    )
+    # #endregion
     results_queue = actor.eval_results_queue if is_eval else actor.results_queue
     results_queue.put(result)
+    # #region debug-point H5:result-queued
+    _debug_report(
+        "H5",
+        "vllm_utils.finalize_completed_request",
+        "put result into queue",
+        {"base_request_id": base_request_id, "is_eval": is_eval},
+    )
+    # #endregion
 
 
 async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, example: dict) -> tuple[list[float], dict]:
@@ -732,7 +908,12 @@ class LLMRayActor:
 
     def _init_openai_client(self) -> None:
         base_url = f"http://127.0.0.1:{self.server_port}/v1"
-        self.client = openai.AsyncOpenAI(base_url=base_url, api_key="EMPTY", timeout=3600)
+        # This client talks only to the local vLLM OpenAI-compatible server.
+        # Disable env-derived proxy handling because some Ray actor environments
+        # contain proxy-related settings that httpx parses poorly, despite the
+        # request target being 127.0.0.1.
+        http_client = httpx.AsyncClient(trust_env=False, timeout=3600)
+        self.client = openai.AsyncOpenAI(base_url=base_url, api_key="EMPTY", timeout=3600, http_client=http_client)
         self.model_name = self.llm_engine.vllm_config.model_config.model
 
         logger.info(f"Waiting for vLLM OpenAI API server to be ready at {base_url}")
@@ -894,14 +1075,54 @@ async def _acquire_and_reset_pools(
         if pool is None:
             raise ValueError(f"No pool for target '{pool_name}'. Available: {list(pools.keys())}")
 
+        # #region debug-point H2:pool-acquire-start
+        _debug_report(
+            "H2",
+            "vllm_utils._acquire_and_reset_pools",
+            "starting pool acquire",
+            {"pool_name": pool_name, "configured_tools": sorted(configured_tools)},
+        )
+        # #endregion
         target_actor = await pool.acquire.remote()
+        # #region debug-point H2:pool-acquire-end
+        _debug_report("H2", "vllm_utils._acquire_and_reset_pools", "finished pool acquire", {"pool_name": pool_name})
+        # #endregion
         acquired[pool_name] = (pool, target_actor)
         actor_map[pool_name] = target_actor
         active_env_names.append(pool_name)
 
         entry = env_config.env_configs.get(pool_name, EnvConfigEntry(env_name=pool_name, is_text_env=False))
+        # #region debug-point H2:pool-reset-start
+        _debug_report(
+            "H2",
+            "vllm_utils._acquire_and_reset_pools",
+            "starting target reset",
+            {"pool_name": pool_name, "reset_kwargs": entry.kwargs},
+        )
+        # #endregion
         _, target_tools = await target_actor.reset.remote(**entry.kwargs)
+        # #region debug-point H2:pool-reset-end
+        _debug_report(
+            "H2",
+            "vllm_utils._acquire_and_reset_pools",
+            "finished target reset",
+            {"pool_name": pool_name, "num_target_tools": len(target_tools or [])},
+        )
+        # #endregion
+        # #region debug-point H2:response-role-start
+        _debug_report(
+            "H2", "vllm_utils._acquire_and_reset_pools", "starting get_response_role", {"pool_name": pool_name}
+        )
+        # #endregion
         target_response_role = await target_actor.get_response_role.remote()
+        # #region debug-point H2:response-role-end
+        _debug_report(
+            "H2",
+            "vllm_utils._acquire_and_reset_pools",
+            "finished get_response_role",
+            {"pool_name": pool_name, "target_response_role": target_response_role},
+        )
+        # #endregion
         tool_response_roles[pool_name] = target_response_role
 
         new_actors, new_tools, new_roles = _register_tool_dispatch(
@@ -959,6 +1180,8 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
     max_steps = env_config.max_steps
 
     output = None
+    saw_answer = False
+    force_answer_reason: str | None = None
     pool_setup = PoolSetup(
         acquired={},
         actor_map={},
@@ -968,14 +1191,43 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
         text_env_names=[],
     )
     try:
+        # #region debug-point H2:process-start
+        _debug_report(
+            "H2",
+            "vllm_utils.process_request",
+            "started processing subrequest",
+            {
+                "base_request_id": base_request_id,
+                "sub_request_id": sub_request_id,
+                "prompt_len": len(original_prompt),
+                "max_tokens": sampling_params.max_tokens,
+                "max_model_len": max_model_len,
+                "max_steps": max_steps,
+                "configured_tools": sorted(configured_tools),
+                "allowed_tools": sorted(allowed_tools),
+            },
+        )
+        # #endregion
+        # #region debug-point H2:after-process-start
+        _debug_write_raw(f"{sub_request_id} after-process-start before-unknown-targets")
+        # #endregion
         unknown_targets = set(env_config.env_configs) - configured_tools
+        # #region debug-point H2:after-unknown-targets
+        _debug_write_raw(f"{sub_request_id} after-unknown-targets count={len(unknown_targets)}")
+        # #endregion
         if unknown_targets:
             raise ValueError(
                 f"env_config references envs/tools that are not configured: {sorted(unknown_targets)}. "
                 f"Available envs/tools: {sorted(configured_tools)}"
             )
 
+        # #region debug-point H2:before-acquire-reset
+        _debug_write_raw(f"{sub_request_id} before-acquire-reset")
+        # #endregion
         pool_setup = await _acquire_and_reset_pools(actor.pools, configured_tools, env_config, allowed_tools)
+        # #region debug-point H2:after-acquire-reset
+        _debug_write_raw(f"{sub_request_id} after-acquire-reset")
+        # #endregion
         actor_map = pool_setup.actor_map
         allowed_tools = pool_setup.allowed_tools
         tool_response_roles = pool_setup.tool_response_roles
@@ -995,6 +1247,22 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
+            # #region debug-point H2:vllm-request-start
+            _debug_report(
+                "H2",
+                "vllm_utils.process_request",
+                "starting vLLM completion request",
+                {
+                    "base_request_id": base_request_id,
+                    "sub_request_id": sub_request_id,
+                    "step_count": rollout.step_count,
+                    "current_prompt_len": len(current_prompt),
+                    "remaining_budget": remaining_budget,
+                    "remaining_room": remaining_room,
+                    "current_max_tokens": current_max_tokens,
+                },
+            )
+            # #endregion
             api_response = await actor.client.completions.create(
                 model=actor.model_name,
                 prompt=current_prompt,
@@ -1010,6 +1278,22 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
 
             output = api_response.choices[0]
             model_tokens = list(output.token_ids)
+            saw_answer = saw_answer or "<answer" in output.text
+            # #region debug-point H2:vllm-request-end
+            _debug_report(
+                "H2",
+                "vllm_utils.process_request",
+                "finished vLLM completion request",
+                {
+                    "base_request_id": base_request_id,
+                    "sub_request_id": sub_request_id,
+                    "step_count": rollout.step_count,
+                    "finish_reason": output.finish_reason,
+                    "num_tokens": len(model_tokens),
+                    "text_prefix": output.text[:200],
+                },
+            )
+            # #endregion
             response_tokens.extend(model_tokens)
             current_prompt.extend(model_tokens)
 
@@ -1019,13 +1303,17 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 cumulative_logprob += logprob
             response_masks.extend([1] * len(model_tokens))
 
-            tool_calls = [tc for tc in actor.tool_parser.get_tool_calls(output.text) if tc.name in allowed_tools]
+            raw_tool_call = output_has_raw_tool_call(output.text)
+            parsed_tool_calls = actor.tool_parser.get_tool_calls(output.text)
+            tool_calls = [tc for tc in parsed_tool_calls if tc.name in allowed_tools]
 
             # Text envs: inject a shadow tool call so dispatch handles it uniformly
             for text_env_name in text_env_names:
                 tool_calls.append(EnvCall(id="", name=text_env_name, args={"text": output.text}))
 
             if not tool_calls:
+                if raw_tool_call and not saw_answer:
+                    force_answer_reason = "invalid_tool_call"
                 break
 
             observations: list[tuple[str, str]] = []
@@ -1043,10 +1331,41 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 rollout.step_count += 1
 
                 try:
+                    # #region debug-point H3:tool-start
+                    _debug_report(
+                        "H3",
+                        "vllm_utils.process_request",
+                        "starting tool step",
+                        {
+                            "base_request_id": base_request_id,
+                            "sub_request_id": sub_request_id,
+                            "tool_name": tc.name,
+                            "step_count": rollout.step_count,
+                            "args": tc.args,
+                            "timeout": actor.tool_call_timeout,
+                        },
+                    )
+                    # #endregion
                     step_result: StepResult = await asyncio.wait_for(
                         target.step.remote(EnvCall(id=str(rollout.step_count), name=tc.name, args=tc.args)),
                         timeout=actor.tool_call_timeout,
                     )
+                    # #region debug-point H3:tool-end
+                    _debug_report(
+                        "H3",
+                        "vllm_utils.process_request",
+                        "finished tool step",
+                        {
+                            "base_request_id": base_request_id,
+                            "sub_request_id": sub_request_id,
+                            "tool_name": tc.name,
+                            "step_count": rollout.step_count,
+                            "result_chars": len(step_result.result or ""),
+                            "done": step_result.done,
+                            "metadata": step_result.metadata or {},
+                        },
+                    )
+                    # #endregion
                     observations.append((step_result.result, tool_response_roles.get(tc.name, "tool")))
                     rollout.tool_output += step_result.result
                     rollout.rewards.append(step_result.reward)
@@ -1065,6 +1384,20 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     )
                 except asyncio.TimeoutError:
                     error_msg = f"Step '{tc.name}' timed out after {actor.tool_call_timeout}s. Args: {tc.args}"
+                    # #region debug-point H3:tool-timeout
+                    _debug_report(
+                        "H3",
+                        "vllm_utils.process_request",
+                        "tool step timed out",
+                        {
+                            "base_request_id": base_request_id,
+                            "sub_request_id": sub_request_id,
+                            "tool_name": tc.name,
+                            "step_count": rollout.step_count,
+                            "timeout": actor.tool_call_timeout,
+                        },
+                    )
+                    # #endregion
                     logger.warning(error_msg)
                     observations.append((error_msg, "tool"))
                     rollout.tool_error += error_msg
@@ -1075,6 +1408,20 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     )
                 except Exception as e:
                     error_msg = f"Step '{tc.name}' failed: {e}. Args: {tc.args}"
+                    # #region debug-point H3:tool-error
+                    _debug_report(
+                        "H3",
+                        "vllm_utils.process_request",
+                        "tool step failed",
+                        {
+                            "base_request_id": base_request_id,
+                            "sub_request_id": sub_request_id,
+                            "tool_name": tc.name,
+                            "step_count": rollout.step_count,
+                            "error": repr(e),
+                        },
+                    )
+                    # #endregion
                     logger.warning(error_msg)
                     observations.append((error_msg, "tool"))
                     rollout.tool_error += error_msg
@@ -1107,6 +1454,147 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                         break
                 if exceeded_context_budget:
                     break
+
+        if rollout.step_count >= max_steps and not saw_answer:
+            force_answer_reason = force_answer_reason or "max_steps_exhausted"
+
+        if force_answer_reason and not saw_answer:
+            prompt_tokens, prompt_logprobs, prompt_masks = process_force_answer_prompt_tokens(
+                FORCE_FINAL_ANSWER_PROMPT,
+                actor.llm_engine.tokenizer,
+                len(current_prompt),
+                len(response_masks),
+                max_model_len,
+                sampling_params.max_tokens,
+            )
+            response_tokens.extend(prompt_tokens)
+            response_logprobs.extend(prompt_logprobs)
+            response_masks.extend(prompt_masks)
+            current_prompt.extend(prompt_tokens)
+
+            remaining_budget = sampling_params.max_tokens - len(response_masks)
+            remaining_room = max_model_len - len(current_prompt)
+            per_turn_budget = actor.per_turn_max_tokens if actor.per_turn_max_tokens is not None else remaining_budget
+            current_max_tokens = max(1, min(remaining_budget, remaining_room, per_turn_budget))
+            if prompt_tokens and remaining_budget > 0 and remaining_room > 0:
+                params_dict = force_answer_sampling_params(sampling_params, current_max_tokens)
+                min_tokens = params_dict.pop("min_tokens", 0)
+                rollout.info["force_answer_reason"] = force_answer_reason
+                rollout.info["max_steps_exhausted"] = rollout.step_count >= max_steps
+                rollout.info["forced_answer_attempted"] = True
+                # #region debug-point H2:force-answer-start
+                _debug_report(
+                    "H2",
+                    "vllm_utils.process_request",
+                    "starting forced final-answer completion request",
+                    {
+                        "base_request_id": base_request_id,
+                        "sub_request_id": sub_request_id,
+                        "step_count": rollout.step_count,
+                        "current_prompt_len": len(current_prompt),
+                        "remaining_budget": remaining_budget,
+                        "remaining_room": remaining_room,
+                        "current_max_tokens": current_max_tokens,
+                        "force_answer_reason": force_answer_reason,
+                    },
+                )
+                # #endregion
+                force_answer_started_at = time.monotonic()
+                try:
+                    api_response = await asyncio.wait_for(
+                        actor.client.completions.create(
+                            model=actor.model_name,
+                            prompt=current_prompt,
+                            extra_body={
+                                "return_token_ids": True,
+                                "cache_salt": base_request_id,
+                                "include_stop_str_in_output": True,
+                                "skip_special_tokens": False,
+                                "min_tokens": min_tokens,
+                            },
+                            **params_dict,
+                        ),
+                        timeout=actor.tool_call_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    force_answer_elapsed_s = time.monotonic() - force_answer_started_at
+                    # #region debug-point H2:force-answer-timeout
+                    _debug_report(
+                        "H2",
+                        "vllm_utils.process_request",
+                        "forced final-answer completion timed out",
+                        {
+                            "base_request_id": base_request_id,
+                            "sub_request_id": sub_request_id,
+                            "step_count": rollout.step_count,
+                            "force_answer_reason": force_answer_reason,
+                            "elapsed_s": round(force_answer_elapsed_s, 3),
+                            "timeout_s": actor.tool_call_timeout,
+                            "current_prompt_len": len(current_prompt),
+                            "current_max_tokens": current_max_tokens,
+                            "stop": params_dict.get("stop"),
+                        },
+                    )
+                    # #endregion
+                    raise
+                except Exception as e:
+                    force_answer_elapsed_s = time.monotonic() - force_answer_started_at
+                    # #region debug-point H2:force-answer-error
+                    _debug_report(
+                        "H2",
+                        "vllm_utils.process_request",
+                        "forced final-answer completion failed",
+                        {
+                            "base_request_id": base_request_id,
+                            "sub_request_id": sub_request_id,
+                            "step_count": rollout.step_count,
+                            "force_answer_reason": force_answer_reason,
+                            "elapsed_s": round(force_answer_elapsed_s, 3),
+                            "error_type": type(e).__name__,
+                            "error": repr(e),
+                            "current_prompt_len": len(current_prompt),
+                            "current_max_tokens": current_max_tokens,
+                            "stop": params_dict.get("stop"),
+                        },
+                    )
+                    # #endregion
+                    raise
+
+                output = api_response.choices[0]
+                model_tokens = list(output.token_ids)
+                saw_answer = saw_answer or "<answer" in output.text
+                force_answer_elapsed_s = time.monotonic() - force_answer_started_at
+                # #region debug-point H2:force-answer-end
+                _debug_report(
+                    "H2",
+                    "vllm_utils.process_request",
+                    "finished forced final-answer completion request",
+                    {
+                        "base_request_id": base_request_id,
+                        "sub_request_id": sub_request_id,
+                        "step_count": rollout.step_count,
+                        "finish_reason": output.finish_reason,
+                        "num_tokens": len(model_tokens),
+                        "saw_answer": saw_answer,
+                        "force_answer_reason": force_answer_reason,
+                        "elapsed_s": round(force_answer_elapsed_s, 3),
+                        "stop": params_dict.get("stop"),
+                        "text_prefix": output.text[:200],
+                    },
+                )
+                # #endregion
+                response_tokens.extend(model_tokens)
+                current_prompt.extend(model_tokens)
+
+                assert output.logprobs and output.logprobs.token_logprobs, "logprobs must be available"
+                for logprob in output.logprobs.token_logprobs:
+                    response_logprobs.append(logprob)
+                    cumulative_logprob += logprob
+                response_masks.extend([1] * len(model_tokens))
+            else:
+                rollout.info["force_answer_reason"] = force_answer_reason
+                rollout.info["max_steps_exhausted"] = rollout.step_count >= max_steps
+                rollout.info["forced_answer_skipped"] = True
     finally:
         env_metrics: dict[str, dict[str, float]] = {}
         for env_name in pool_setup.active_env_names:

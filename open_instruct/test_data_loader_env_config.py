@@ -30,6 +30,24 @@ class TestMergeEnvConfig(unittest.TestCase):
         merged = _merge_env_config(base, {"env_configs": [{"env_name": "counter", "target": 7}]})
         self.assertEqual(merged.env_configs["counter"].kwargs, {"difficulty": "hard", "target": 7})
 
+    def test_sample_env_name_matches_call_name_alias(self):
+        base = _base(_entry("ScholarSearch"), _entry("GeneralSearch"), _entry("Fetch"))
+        merged = _merge_env_config(
+            base,
+            {
+                "env_configs": [
+                    {"env_name": "scholar_search", "last_time": "2024-01-01"},
+                    {"env_name": "general_search", "curr_title": "test"},
+                    {"env_name": "fetch", "last_time": "2023-01-01"},
+                ]
+            },
+        )
+
+        self.assertEqual(set(merged.env_configs), {"ScholarSearch", "GeneralSearch", "Fetch"})
+        self.assertEqual(merged.env_configs["ScholarSearch"].kwargs, {"last_time": "2024-01-01"})
+        self.assertEqual(merged.env_configs["GeneralSearch"].kwargs, {"curr_title": "test"})
+        self.assertEqual(merged.env_configs["Fetch"].kwargs, {"last_time": "2023-01-01"})
+
     def test_sample_env_without_name_raises(self):
         with self.assertRaises(KeyError):
             _merge_env_config(_base(_entry("counter")), {"env_configs": [{"target": 3}]})

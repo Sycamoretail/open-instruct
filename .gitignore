@@ -7,6 +7,7 @@ token_length.png
 # For generating datasets.
 *.jsonl
 !open_instruct/test_data/*.jsonl
+!eval_output/
 
 # for on policy preferences
 birr/
@@ -19,6 +20,7 @@ wandb
 data/*
 # !data/processed
 output/
+outputs/
 configs/beaker_configs/auto_created
 
 # Byte-compiled / optimized / DLL files

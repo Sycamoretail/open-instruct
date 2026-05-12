@@ -302,34 +302,71 @@ class DRTuluToolParser(ToolParser):
     Parser for DR Tulu style tool calls. Delegates actual parsing to the tool itself.
     Only detects that a tool call occurred (via stop strings) and passes text to the tool.
 
-    Requires exactly one tool (dr_agent_mcp) in tool_definitions.
+    Supports two modes:
+    - Single `dr_agent_mcp` tool: pass the full text through to the tool.
+    - Generic `<call_tool name="...">...</call_tool>` routing across multiple tools.
     """
 
     def __init__(self, tool_definitions: list[dict[str, Any]], stop_sequences: list[str]):
-        if len(tool_definitions) != 1:
-            raise ValueError(f"DRTuluToolParser requires exactly one tool (dr_agent_mcp), got {len(tool_definitions)}")
+        if not tool_definitions:
+            raise ValueError("DRTuluToolParser requires at least one tool definition")
+
+        self.stop_sequences = list(dict.fromkeys(stop_sequences)) if stop_sequences else ["</call_tool>"]
+        self.call_tool_regex = re.compile(r"<call_tool\s+([^>]*)>(.*?)</call_tool>", re.DOTALL)
+        self.attr_regex = re.compile(r'([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"([^"]*)"')
 
         self.tool_call_name = tool_definitions[0]["function"]["name"]
+        self.delegate_to_single_tool = len(tool_definitions) == 1 and self.tool_call_name == "dr_agent_mcp"
 
-        if self.tool_call_name != "dr_agent_mcp":
-            raise ValueError(f"DRTuluToolParser requires dr_agent_mcp tool, got {self.tool_call_name}")
+        if self.delegate_to_single_tool:
+            if not self.stop_sequences:
+                logger.warning(
+                    "DRTuluToolParser initialized with no stop sequences — tool calls will never be detected"
+                )
+            return
 
-        self.stop_sequences = list(dict.fromkeys(stop_sequences)) if stop_sequences else []
+        self.tool_names = [td["function"]["name"] for td in tool_definitions]
+        self.tool_param_names: dict[str, str] = {}
+        for td in tool_definitions:
+            func = td["function"]
+            name = func["name"]
+            params = func.get("parameters", {})
+            required = params.get("required", [])
+            if required:
+                self.tool_param_names[name] = required[0]
+            else:
+                properties = params.get("properties", {})
+                self.tool_param_names[name] = next(iter(properties)) if properties else "text"
 
-        if not self.stop_sequences:
-            logger.warning("DRTuluToolParser initialized with no stop sequences — tool calls will never be detected")
+        assert len(self.tool_names) == len(set(self.tool_names)), "Tool names must be unique"
 
     def get_tool_calls(self, text: str) -> list[EnvCall]:
-        for stop in self.stop_sequences:
-            if stop in text:
-                return [EnvCall(id="", name=self.tool_call_name, args={"text": text})]
-        return []
+        if self.delegate_to_single_tool:
+            for stop in self.stop_sequences:
+                if stop in text:
+                    return [EnvCall(id="", name=self.tool_call_name, args={"text": text})]
+            return []
+
+        tool_calls: list[EnvCall] = []
+        for match in self.call_tool_regex.finditer(text):
+            attrs = {k: v for k, v in self.attr_regex.findall(match.group(1))}
+            tool_name = attrs.pop("name", "").strip()
+            if not tool_name or tool_name not in self.tool_param_names:
+                continue
+
+            param_name = self.tool_param_names.get(tool_name, "text")
+            tool_content = match.group(2).strip()
+            if tool_content and param_name not in attrs:
+                attrs[param_name] = tool_content
+            tool_calls.append(EnvCall(id="", name=tool_name, args=attrs))
+        return tool_calls
 
     def _format_tool_output(self, tool_output: str) -> str:
-        return f"<tool_output>\n{tool_output}\n</tool_output>\n"
+        return f"<|im_start|>user\n<tool_response>\n{tool_output}\n</tool_response>\n<|im_end|>\n"
 
     def _format_tool_outputs(self, tool_outputs: list[str], role: str = "tool") -> str:
-        return "\n".join(self._format_tool_output(output) for output in tool_outputs)
+        parts = "".join(self._format_tool_output(output) for output in tool_outputs)
+        return f"<|im_end|>\n{parts}<|im_start|>assistant\n"
 
 
 def get_available_parsers() -> list[str]:

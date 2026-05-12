@@ -115,6 +115,7 @@ from open_instruct.utils import (
     RayProcess,
     UlyssesSPSplitter,
     _z3_params_to_fetch,
+    clean_last_n_checkpoints,
     clean_last_n_checkpoints_deepspeed,
     get_eval_ds_config,
     get_optimizer_grouped_parameters,
@@ -159,7 +160,7 @@ def _build_data_prep_actor_resume_state(checkpoint_state: dict[str, Any] | None)
 
 
 CHECKPOINT_COMPLETE_MARKER = ".checkpoint_complete"
-WEIGHT_SYNC_TIMEOUT_S = 120.0
+WEIGHT_SYNC_TIMEOUT_S = float(os.environ.get("WEIGHT_SYNC_TIMEOUT_S", "180"))
 CLUSTER_STARTUP_TIMEOUT_S = 1200.0
 PLACEMENT_GROUP_READY_TIMEOUT_S = 300.0
 LEARNER_ACTOR_NUM_CPUS = 4
@@ -1763,6 +1764,8 @@ def maybe_save_checkpoint(
                     policy_group.models[i].launch_ai2_evals_on_weka_wrapper.remote(
                         step_dir, leaderboard_name, wandb_url, training_step
                     )
+            if args.keep_last_n_checkpoints >= 0:
+                clean_last_n_checkpoints(checkpoint_dir, args.keep_last_n_checkpoints)
         save_time = timer.duration
 
     return save_time
@@ -2259,7 +2262,12 @@ def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_l
     for i in range(0, len(dataset_mixer_list), 2):
         dataset_name = dataset_mixer_list[i]
         split = splits[i // 2]
-        ds = datasets.load_dataset(dataset_name, split=split)
+        if dataset_name.endswith(".json") or dataset_name.endswith(".jsonl"):
+            ds = datasets.load_dataset("json", data_files=dataset_name, split=split)
+        elif dataset_name.endswith(".parquet"):
+            ds = datasets.load_dataset("parquet", data_files=dataset_name, split=split)
+        else:
+            ds = datasets.load_dataset(dataset_name, split=split)
         if TOOLS_COLUMN_KEY in ds.column_names:
             for tools in ds[TOOLS_COLUMN_KEY]:
                 if tools:
@@ -2323,8 +2331,8 @@ def initialize_tools_and_envs(
             config = config_cls()
             tool_cls = config_cls.tool_class
             call_name = getattr(tool_cls, "call_name", name)
-            kwargs = asdict(config) | {"call_name": call_name}
-            pools[call_name] = EnvironmentPool.remote(pool_size=pool_size, actor_class=tool_cls, **kwargs)
+            kwargs = asdict(config) | {"call_name": call_name, "pool_size": config.pool_size or pool_size}
+            pools[call_name] = EnvironmentPool.remote(actor_class=tool_cls, **kwargs)
             tool_call_names.append(call_name)
             # Collect tool definitions from newly created pool
             new_actor = ray.get(pools[call_name].acquire.remote())

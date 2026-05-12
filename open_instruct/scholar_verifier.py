@@ -28,30 +28,13 @@ import dataclasses
 import json
 import os
 import re
-import sys
 import traceback
 from typing import Any
 
-from open_instruct import logger_utils
-from open_instruct.ground_truth_utils import (
-    VerificationResult,
-    VerifierConfig,
-    VerifierFunction,
-)
+from open_instruct import logger_utils, scholar_evaluator
+from open_instruct.ground_truth_utils import VerificationResult, VerifierConfig, VerifierFunction
 
 logger = logger_utils.setup_logger(__name__)
-
-
-# Make evaluator.py importable - it lives at the repo root next to this file.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-try:
-    import evaluator as scholar_evaluator  # noqa: E402  (path mangling above)
-except Exception as e:  # pragma: no cover - best effort import
-    logger.warning(f"Failed to import top-level evaluator.py: {e}")
-    scholar_evaluator = None
 
 
 # ---------------------------------------------------------------------------
@@ -74,12 +57,21 @@ except Exception as e:  # pragma: no cover - best effort import
 _MOCK_ENV_VAR = "SCHOLAR_MOCK_REWARD"
 
 
-_CALL_TOOL_RE = re.compile(
-    r"<call_tool\s+([^>]*name\s*=\s*\"[^\"]+\"[^>]*)>(.*?)</call_tool>",
-    re.DOTALL,
-)
+_CALL_TOOL_RE = re.compile(r"<call_tool\s+([^>]*name\s*=\s*\"[^\"]+\"[^>]*)>(.*?)</call_tool>", re.DOTALL)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 _CITE_RE = re.compile(r"<cite\s+id\s*=\s*\"([^\"]+)\"\s*>(.*?)</cite>", re.DOTALL)
+
+_WANDB_METRIC_NAME_MAP = {
+    "score": "final_score_raw",
+    "base_score": "base_score",
+    "format_reward": "format_reward",
+    "format_reward_weight": "format_reward_weight",
+    "citation_len": "citation_len",
+    "reference_coverage_score": "reference_coverage_score",
+    "nugget_coverage_score": "nugget_coverage_score",
+    "citation_precision_score": "citation_precision_score",
+    "relevance_rate_score": "relevance_rate_score",
+}
 
 
 def _mock_format_reward(prediction: str) -> tuple[float, dict[str, bool]]:
@@ -106,6 +98,15 @@ def _mock_format_reward(prediction: str) -> tuple[float, dict[str, bool]]:
 
     score = sum(1 for v in checks.values() if v) / max(1, len(checks))
     return score, checks
+
+
+def _extract_wandb_metrics(result_dict: dict[str, Any]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for source_key, metric_name in _WANDB_METRIC_NAME_MAP.items():
+        value = result_dict.get(source_key)
+        if isinstance(value, bool | int | float):
+            metrics[metric_name] = float(value)
+    return metrics
 
 
 def _mock_mode_enabled() -> bool:
@@ -189,6 +190,7 @@ class _ScholarVerifierMixin:
             return VerificationResult(
                 score=float(score),
                 reasoning=json.dumps({"mock": True, **checks}, ensure_ascii=False),
+                metadata={"final_score_raw": float(score), "format_reward": float(score)},
             )
 
         if scholar_evaluator is None:
@@ -200,9 +202,7 @@ class _ScholarVerifierMixin:
 
         try:
             result_dict, ok = await scholar_evaluator.evaluate_scholar_score_verifier(
-                candidate=prediction or "",
-                ground_truth=ground_truth,
-                tool_results_str=tool_results_str,
+                candidate=prediction or "", ground_truth=ground_truth, tool_results_str=tool_results_str
             )
         except Exception as e:
             logger.error(f"ScholarVerifier[{self.dataset_name}] evaluator error: {e}\n{traceback.format_exc()}")
@@ -217,7 +217,11 @@ class _ScholarVerifierMixin:
             score = 0.0
 
         reasoning_bits = {k: v for k, v in result_dict.items() if k not in {"candidate", "judge_response"}}
-        return VerificationResult(score=score, reasoning=json.dumps(reasoning_bits, ensure_ascii=False, default=str))
+        return VerificationResult(
+            score=score,
+            reasoning=json.dumps(reasoning_bits, ensure_ascii=False, default=str),
+            metadata=_extract_wandb_metrics(result_dict),
+        )
 
     def __call__(
         self,
@@ -230,9 +234,7 @@ class _ScholarVerifierMixin:
         """Synchronous fallback - run the async path on a fresh loop."""
         try:
             asyncio.get_running_loop()
-            raise RuntimeError(
-                "ScholarVerifier must be invoked via async_call from an async context."
-            )
+            raise RuntimeError("ScholarVerifier must be invoked via async_call from an async context.")
         except RuntimeError:
             pass
         return asyncio.run(self.async_call(tokenized_prediction, prediction, label, query, rollout_state))

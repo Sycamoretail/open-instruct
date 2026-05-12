@@ -33,6 +33,25 @@ class TestTruncateEnvOutputTokens(unittest.TestCase):
         self.assertEqual(excess, expected_excess)
 
 
+class TestForceAnswerPromptTokens(unittest.TestCase):
+    def test_extracts_input_ids_from_batch_encoding_like_object(self):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = {"input_ids": [11, 12, 13], "attention_mask": [1, 1, 1]}
+
+        tokens, logprobs, masks = vllm_utils.process_force_answer_prompt_tokens(
+            prompt="force final answer",
+            tokenizer=tokenizer,
+            current_prompt_len=0,
+            current_response_len=0,
+            max_model_len=32,
+            max_tokens=32,
+        )
+
+        self.assertEqual(tokens, [11, 12, 13])
+        self.assertEqual(logprobs, [0.0, 0.0, 0.0])
+        self.assertEqual(masks, [0, 0, 0])
+
+
 class TestVllmUtils3(unittest.TestCase):
     def setUp(self):
         logging.disable(logging.CRITICAL)

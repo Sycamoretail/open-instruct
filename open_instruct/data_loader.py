@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import threading
@@ -52,6 +53,38 @@ from open_instruct.utils import combine_reward_metrics, repeat_each
 logger = logging.getLogger(__name__)
 
 DATA_PREP_ACTOR_NAME = "data_prep_singleton"
+
+
+# #region debug-point helper:rl-rollout-stall
+def _debug_report(hypothesis_id: str, location: str, msg: str, data: dict[str, Any] | None = None) -> None:
+    try:
+        env_path = ".dbg/rl-rollout-stall.env"
+        url = "http://127.0.0.1:7777/event"
+        session_id = "rl-rollout-stall"
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("DEBUG_SERVER_URL="):
+                        url = line.split("=", 1)[1].strip()
+                    elif line.startswith("DEBUG_SESSION_ID="):
+                        session_id = line.split("=", 1)[1].strip()
+        payload = {
+            "sessionId": session_id,
+            "runId": "pre",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": f"[DEBUG] {msg}",
+            "data": data or {},
+            "ts": int(time.time() * 1000),
+        }
+        os.makedirs(".dbg", exist_ok=True)
+        with open(".dbg/rl-rollout-stall-local.ndjson", "a") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# #endregion
 
 
 def to_device(batch: dict[str, Any], device: torch.device | None) -> dict[str, Any]:
@@ -661,6 +694,20 @@ def single_example_collator(examples: list[dict[str, Any]]) -> dict[str, Any]:
     return example | {"index": torch.tensor([example["index"]])}
 
 
+def _normalize_env_name_for_match(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _resolve_env_config_name(env_name: str, merged: dict[str, EnvConfigEntry]) -> str:
+    if env_name in merged:
+        return env_name
+    normalized = _normalize_env_name_for_match(env_name)
+    for candidate in merged:
+        if _normalize_env_name_for_match(candidate) == normalized:
+            return candidate
+    return env_name
+
+
 def _merge_env_config(base_env_config: EnvConfig, sample_env_config: dict[str, Any] | None) -> EnvConfig:
     """Merge base and sample env config into canonical payload.
     Sample env_config overrides any base env_configs with the same name.
@@ -672,7 +719,7 @@ def _merge_env_config(base_env_config: EnvConfig, sample_env_config: dict[str, A
 
     merged = dict(base_env_config.env_configs)
     for sample_entry in sample_env_config.get("env_configs", []):
-        env_name = sample_entry["env_name"]
+        env_name = _resolve_env_config_name(sample_entry["env_name"], merged)
         base = merged.get(env_name)
         is_text_env = sample_entry.get("is_text_env", base.is_text_env if base else False)
         extra = {k: v for k, v in sample_entry.items() if k not in ("env_name", "is_text_env")}
@@ -796,12 +843,28 @@ def accumulate_inference_batches(
     logger.info(
         f"[accumulate_inference_batches] Starting to accumulate {num_prompts} prompts, training_step={training_step}"
     )
+    # #region debug-point H5:accumulate-start
+    _debug_report(
+        "H5",
+        "data_loader.accumulate_inference_batches",
+        "starting to accumulate inference results",
+        {"num_prompts": num_prompts, "training_step": training_step},
+    )
+    # #endregion
     num_prompts_sampled = 0
     collected_results = []  # Track results for potential requeue on timeout
     while num_prompts_sampled < num_prompts:
         logger.info(
             f"[accumulate_inference_batches] Waiting for result {num_prompts_sampled + 1}/{num_prompts} from inference_results_Q"
         )
+        # #region debug-point H5:result-wait
+        _debug_report(
+            "H5",
+            "data_loader.accumulate_inference_batches",
+            "waiting for inference result",
+            {"training_step": training_step, "next_result": num_prompts_sampled + 1, "num_prompts": num_prompts},
+        )
+        # #endregion
         try:
             result = inference_results_Q.get(timeout=timeout)
         except Empty:
@@ -816,6 +879,19 @@ def accumulate_inference_batches(
         logger.info(
             f"[accumulate_inference_batches] Got result {num_prompts_sampled + 1}/{num_prompts}, type: {type(result).__name__}"
         )
+        # #region debug-point H5:result-got
+        _debug_report(
+            "H5",
+            "data_loader.accumulate_inference_batches",
+            "got inference result",
+            {
+                "training_step": training_step,
+                "result_num": num_prompts_sampled + 1,
+                "num_prompts": num_prompts,
+                "result_type": type(result).__name__,
+            },
+        )
+        # #endregion
 
         if isinstance(result, data_types.ShutdownSentinel):
             return result, None, None, None
