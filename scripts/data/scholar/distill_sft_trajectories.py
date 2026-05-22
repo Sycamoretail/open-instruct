@@ -439,6 +439,7 @@ def _render_assistant_xml(assistant_msg: dict[str, Any]) -> str:
     tool_calls = assistant_msg.get("tool_calls") or []
 
     # 优先复用 teacher 自己写的 <think>；没有就把 plain content 当 think body。
+    # 注意：如果 teacher 直接输出 <answer> 而没有 <think>，不应该把 <answer> 嵌套进 <think> 内部。
     think_text = ""
     if content:
         m = _THINK_RE.search(content)
@@ -446,8 +447,15 @@ def _render_assistant_xml(assistant_msg: dict[str, Any]) -> str:
             think_text = m.group(1).strip()
             content_wo_think = _THINK_RE.sub("", content, count=1).strip()
         else:
-            think_text = content
-            content_wo_think = ""
+            # 没有 <think>：检查是否有 <answer>，如果有则不把 answer 当作 think 内容
+            m_ans = _ANSWER_RE.search(content)
+            if m_ans:
+                # content 中直接有 <answer>...</answer>，不当作 think
+                think_text = ""
+                content_wo_think = content
+            else:
+                think_text = content
+                content_wo_think = ""
     else:
         content_wo_think = ""
 
@@ -482,7 +490,11 @@ def _render_assistant_xml(assistant_msg: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def translate_trace_to_xml_messages(trace: list[dict[str, Any]], scholar_system_prompt: str) -> list[dict[str, Any]]:
+def translate_trace_to_xml_messages(
+    trace: list[dict[str, Any]],
+    scholar_system_prompt: str,
+    max_tool_response_chars: int = 8192,
+) -> list[dict[str, Any]]:
     """把 OpenAI tool-use trace 翻译成 RL 侧 ``messages``。
 
     * system：替换成 scholar RL system prompt。
@@ -490,6 +502,10 @@ def translate_trace_to_xml_messages(trace: list[dict[str, Any]], scholar_system_
     * assistant (带 tool_calls)：``<think>...</think>\\n<call_tool ...>...</call_tool>``。
     * tool：折叠进单个 user turn ``<tool_response>...\\n</tool_response>``。
     * assistant (最终)：``<think>...</think>\\n<answer>...</answer>``。
+
+    Args:
+        max_tool_response_chars: 每次工具回复的最大字符数，与 RL 训练中
+            scholar_tools.py 的截断保持一致（默认 8192）。
     """
     out: list[dict[str, Any]] = [{"role": "system", "content": scholar_system_prompt}]
 
@@ -499,6 +515,8 @@ def translate_trace_to_xml_messages(trace: list[dict[str, Any]], scholar_system_
         if not pending_tool_responses:
             return
         merged = "\n".join(pending_tool_responses)
+        if max_tool_response_chars > 0 and len(merged) > max_tool_response_chars:
+            merged = merged[:max_tool_response_chars]
         out.append({"role": "user", "content": f"<tool_response>\n{merged}\n</tool_response>"})
         pending_tool_responses.clear()
 
@@ -959,7 +977,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=8)
 
     # Agent loop
-    parser.add_argument("--max-steps", type=int, default=10)
+    parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument(
         "--tool-backend",
         choices=["mock", "internal", "real"],
@@ -968,7 +986,7 @@ def parse_args() -> argparse.Namespace:
         "'real' aliases 'internal'. 'mock' is for offline debug.",
     )
     parser.add_argument(
-        "--last-time", default="2024-01-01T00:00:00", help="ISO timestamp passed to search tools as 'last_time'."
+        "--last-time", default="2026-05-01T00:00:00", help="ISO timestamp passed to search tools as 'last_time'."
     )
 
     # Filtering

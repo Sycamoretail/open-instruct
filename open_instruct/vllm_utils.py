@@ -140,12 +140,13 @@ FORCE_FINAL_ANSWER_PROMPT = (
     "Do not call any tools again. Based only on the evidence already returned above, "
     "write the final answer now. Your response MUST contain exactly one "
     "<think>...</think> block followed by exactly one <answer>...</answer> block. "
-    'Inside <answer>, cite supporting evidence with <cite id="SOURCE_ID"></cite> '
+    'Inside <answer>, cite supporting evidence with <cite id="SOURCE_ID">claim text</cite> '
     "using only source IDs that appeared in the previous tool responses. "
     "Do NOT use bracket citations like [1], [1][2], superscripts, footnotes, or a References section. "
-    "Every factual sentence in <answer> must end with one or more empty citation tags such as "
-    '<cite id="12"></cite> or <cite id="12"></cite><cite id="18"></cite>. '
-    "The citation tag itself must stay exactly in XML form; do not replace it with plain-text numbers. "
+    "Every factual claim in <answer> must be wrapped inside a citation tag, for example "
+    '<cite id="12">some factual claim</cite> or '
+    '<cite id="12">claim A</cite><cite id="18">claim B</cite>. '
+    "The citation tag must wrap the supported text, not be empty. "
     "If the evidence is incomplete, state the uncertainty instead of searching again."
 )
 

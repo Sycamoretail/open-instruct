@@ -7,7 +7,7 @@ token_length.png
 # For generating datasets.
 *.jsonl
 !open_instruct/test_data/*.jsonl
-!eval_output/
+!eval_output/*/*.jsonl
 
 # for on policy preferences
 birr/
@@ -163,3 +163,5 @@ cache/
 local_dataset_cache/
 scratch/
 .claude/worktrees/
+
+.dbg/*

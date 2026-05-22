@@ -486,10 +486,24 @@ def clean_rich_media_reference(text: str, return_citation_ids: bool = False):
             return "", []
         return ""
 
+    # Sanitize: strip injected prompts and <answer> tags inside <think> blocks
+    # so we only process the model's real answer block.
+    text = _sanitize_candidate_for_format_check(text)
+
     citation_ids_set = set()
 
     def _maybe_add_citation_id(raw_id: str) -> int | None:
-        match = re.search(r"(\d+)", str(raw_id))
+        s = str(raw_id)
+        # Handle "call_<hex>-N" legacy format: extract trailing number after last '-'
+        m = re.search(r"-(\d+)$", s)
+        if m:
+            cid = int(m.group(1)) + 1  # 0-indexed in call format -> 1-indexed doc id
+            citation_ids_set.add(cid)
+            return cid
+        # Default: extract the last numeric sequence (handles "N", "<|superscript|>:N", etc.)
+        match = re.search(r"(\d+)\s*$", s)
+        if not match:
+            match = re.search(r"(\d+)", s)
         if not match:
             return None
         try:
@@ -501,6 +515,23 @@ def clean_rich_media_reference(text: str, return_citation_ids: bool = False):
 
     # Prefer the new protocol when present: <answer>...</answer> with inline cites.
     answer_matches = re.findall(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Handle unclosed <answer> at end of text (truncation by max_tokens).
+    # If there are more opening <answer> tags than closing </answer> tags,
+    # extract the trailing unclosed block as well.
+    open_count = len(re.findall(r"<answer>", text, re.IGNORECASE))
+    close_count = len(re.findall(r"</answer>", text, re.IGNORECASE))
+    if open_count > close_count:
+        # Find the last <answer> that has no matching </answer>
+        last_open = text.rfind("<answer>")
+        if last_open == -1:
+            last_open = text.lower().rfind("<answer>")
+        if last_open != -1:
+            trailing_answer = text[last_open + len("<answer>") :]
+            # Only use it if it has meaningful content (not just "..." placeholders)
+            if len(trailing_answer.strip()) > 10:
+                answer_matches.append(trailing_answer)
+
     if answer_matches:
 
         def _replace_cite(match):
@@ -521,6 +552,7 @@ def clean_rich_media_reference(text: str, return_citation_ids: bool = False):
                 )
             )
         cleaned_text = "\n".join(part.strip() for part in cleaned_answers if part.strip())
+
         if return_citation_ids:
             return cleaned_text, sorted(citation_ids_set)
         return cleaned_text
@@ -634,6 +666,30 @@ _CALL_TOOL_RE = re.compile(
 )
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 _CITE_RE = re.compile(r"<cite\s+id\s*=\s*\"([^\"]+)\"\s*>(.*?)</cite>", re.DOTALL | re.IGNORECASE)
+# New format: <cite id="N">wrapped text</cite> (non-empty inner content)
+_CITE_CONTENT_RE = re.compile(r"<cite\s+id\s*=\s*\"([^\"]+)\"\s*>(.+?)</cite>", re.DOTALL | re.IGNORECASE)
+
+# Regex to strip the FORCE_FINAL_ANSWER_PROMPT injected into the candidate text.
+# This prompt contains literal <answer>...</answer> and <think>...</think> examples
+# that confuse the format checks.  We match it loosely so minor edits don't break it.
+_FORCE_PROMPT_RE = re.compile(
+    r"You have reached the maximum number of allowed tool calls\..*?"
+    r"instead of searching again\.",
+    re.DOTALL,
+)
+
+
+def _sanitize_candidate_for_format_check(text: str) -> str:
+    """Remove injected prompts so format checks see only model output.
+
+    The ``FORCE_FINAL_ANSWER_PROMPT`` is appended to the response token
+    stream by ``vllm_utils`` and contains literal ``<answer>...</answer>``
+    / ``<think>...</think>`` examples that confuse the format checks.
+    This function strips that injected text.
+    """
+    # Remove the FORCE_FINAL_ANSWER_PROMPT text.
+    text = _FORCE_PROMPT_RE.sub("", text)
+    return text
 
 
 def _truncate_for_log(text: str, limit: int = 160) -> str:
@@ -673,22 +729,34 @@ def _real_format_reward_weight() -> float:
 
 
 def _protocol_format_reward(prediction: str) -> tuple[float, dict[str, bool]]:
-    text = prediction or ""
+    text = _sanitize_candidate_for_format_check(prediction or "")
     checks: dict[str, bool] = {}
 
     checks["has_call_tool"] = bool(_CALL_TOOL_RE.search(text))
     answer_matches = _ANSWER_RE.findall(text)
     checks["has_single_answer"] = len(answer_matches) == 1
 
-    if checks["has_single_answer"]:
-        checks["has_cite_inside_answer"] = bool(_CITE_RE.search(answer_matches[0]))
+    if answer_matches:
+        # Use the last answer block for cite checking (most likely the real answer).
+        answer_body = answer_matches[-1]
+        checks["has_cite_inside_answer"] = bool(_CITE_CONTENT_RE.search(answer_body) or _CITE_RE.search(answer_body))
     else:
         checks["has_cite_inside_answer"] = False
 
-    checks["tags_balanced"] = (
-        text.count("<call_tool") == text.count("</call_tool>")
-        and text.count("<answer>") == text.count("</answer>")
-        and text.count("<think>") == text.count("</think>")
+    # Check tag balance. Exempt <think> mismatch only when the text was
+    # clearly truncated (no </answer> ending, indicating token budget hit).
+    call_balanced = text.count("<call_tool") == text.count("</call_tool>")
+    answer_balanced = text.count("<answer>") == text.count("</answer>")
+    think_balanced = text.count("<think>") == text.count("</think>")
+    truncated = not text.rstrip().endswith("</answer>") and text.count("<think>") > text.count("</think>")
+    checks["tags_balanced"] = call_balanced and answer_balanced and (think_balanced or truncated)
+
+    # Check nesting: <answer> must NOT be inside <think>...</think>.
+    # The last <answer> must appear AFTER the last </think>.
+    last_think_close = text.rfind("</think>")
+    last_answer_open = text.rfind("<answer>")
+    checks["answer_not_nested"] = (
+        last_answer_open > last_think_close if last_think_close >= 0 else True
     )
 
     score = sum(1 for v in checks.values() if v) / max(1, len(checks))
@@ -712,12 +780,12 @@ def _invalid_reward_candidate_reason(candidate: str | None) -> str | None:
     if candidate is None:
         return None
 
-    text = candidate.strip()
+    text = _sanitize_candidate_for_format_check(candidate).strip()
     if not text:
         return None
 
     answer_matches = _ANSWER_RE.findall(text)
-    has_single_answer = len(answer_matches) == 1
+    has_any_answer = len(answer_matches) >= 1
     has_tool_trace = (
         "<call_tool" in text
         or "<tool_output" in text
@@ -727,9 +795,12 @@ def _invalid_reward_candidate_reason(candidate: str | None) -> str | None:
     )
     has_malformed_tool_trace = "<call_tool" in text and "</call_tool>" not in text
 
-    if not has_single_answer and has_malformed_tool_trace:
+    # Only zero-out when the model truly produced NO answer after tool use.
+    # Multiple answers are penalized via format_reward (partial credit) instead
+    # of being treated as a fatal gate.
+    if not has_any_answer and has_malformed_tool_trace:
         return "malformed_tool_trace_without_final_answer"
-    if not has_single_answer and has_tool_trace:
+    if not has_any_answer and has_tool_trace:
         return "tool_trace_without_final_answer"
     return None
 
@@ -1254,6 +1325,60 @@ async def evaluate_scholar_score_verifier(candidate: str, ground_truth: dict, to
     document_infos = extract_document_infos_from_text(tool_results_str)
     gen_references = [doc for doc in document_infos if doc["id"] in citation_ids]
     result_dict["citation_len"] = len(gen_references)
+
+    # --- Sampled trajectory debug print (5% of calls) ---
+    _traj_sample_rate = float(os.environ.get("SCHOLAR_TRAJ_SAMPLE_RATE", "0.05"))
+    if random.random() < _traj_sample_rate:
+        _has_answer = bool(re.search(r"<answer>", candidate or "", re.IGNORECASE))
+        _has_cite = bool(re.search(r"<cite\s", candidate or "", re.IGNORECASE))
+        _invalid = _invalid_reward_candidate_reason(candidate) if candidate else "candidate_is_None"
+        _doc_ids = sorted([d["id"] for d in document_infos])[:10]
+        _cite_ids = sorted(citation_ids)[:10] if citation_ids else []
+        # Extract a short sample of the answer block for inspection
+        _ans_match = re.search(r"<answer>(.*?)</answer>", candidate or "", re.DOTALL | re.IGNORECASE)
+        _ans_snippet = _ans_match.group(1)[:300] if _ans_match else "NO_ANSWER_BLOCK"
+        # Show what reference_ids the model could see in the candidate text
+        _ref_ids_in_candidate = re.findall(r'reference_id="([^"]{0,40})"', (candidate or "")[:5000])[:5]
+        # Locate <cite> relative to <answer>
+        _cite_positions = [m.start() for m in re.finditer(r"<cite\s", candidate or "", re.IGNORECASE)][:5]
+        _answer_open_pos = [(m.start(), m.end()) for m in re.finditer(r"<answer>", candidate or "", re.IGNORECASE)]
+        _answer_close_pos = [m.start() for m in re.finditer(r"</answer>", candidate or "", re.IGNORECASE)]
+        # Show raw cite tags found in candidate
+        _raw_cite_tags = re.findall(r"(<cite[^>]{0,80}>)", candidate or "", re.IGNORECASE)[:5]
+        # Show candidate tail (last 800 chars) to see the actual answer area
+        _candidate_tail = (candidate or "")[-800:]
+        logger.info(
+            "\n[TRAJ_DEBUG] === Sampled Trajectory ===\n"
+            "  has_answer=%s, has_cite=%s, invalid_reason=%s\n"
+            "  doc_ids_from_tool_results=%s\n"
+            "  citation_ids_from_candidate=%s\n"
+            "  gen_references_matched=%d\n"
+            "  ref_ids_visible_to_model=%s\n"
+            "  tool_results_str_len=%d, candidate_len=%d\n"
+            "  answer_snippet=%r\n"
+            "  answer_open_positions=%s, answer_close_positions=%s\n"
+            "  cite_positions=%s\n"
+            "  raw_cite_tags=%s\n"
+            "  candidate_first_500=%r\n"
+            "  candidate_tail_800=%r\n"
+            "[TRAJ_DEBUG] === End ===",
+            _has_answer,
+            _has_cite,
+            _invalid,
+            _doc_ids,
+            _cite_ids,
+            len(gen_references),
+            _ref_ids_in_candidate,
+            len(tool_results_str or ""),
+            len(candidate or ""),
+            _ans_snippet,
+            _answer_open_pos,
+            _answer_close_pos,
+            _cite_positions,
+            _raw_cite_tags,
+            (candidate or "")[:500],
+            _candidate_tail,
+        )
 
     if ground_truth["data_type"] == "understanding":
         query = ground_truth["verifiable_meta"]["query"]

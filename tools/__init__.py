@@ -501,12 +501,35 @@ def _normalize_urls(url: Any) -> List[str]:
     return [str(url)]
 
 
-def scholar_search_adapter(query: str, top_k: int = 8) -> str:
+_DEFAULT_SCHOLAR_TOP_K = int(os.environ.get("SCHOLAR_SEARCH_TOP_K", "5"))
+
+
+def _truncate_xml_documents(xml_content: str, top_k: int) -> str:
+    """只保留 XML 中前 top_k 个 <document> 块，减少 token 开销。"""
+    if top_k <= 0:
+        return xml_content
+    # 按 <document 分割，保留前 top_k 个
+    parts = re.split(r"(?=<document\s)", xml_content)
+    # parts[0] 是 <document 之前的内容（如 <search ...>）
+    header = parts[0]
+    doc_parts = parts[1:]
+    if len(doc_parts) <= top_k:
+        return xml_content
+    # 保留前 top_k 个文档 + 闭合标签
+    kept = header + "".join(doc_parts[:top_k])
+    # 确保有闭合的 </search> 或其他结尾标签
+    if "</search>" not in kept and "</search>" in xml_content:
+        kept = kept.rstrip() + "\n</search>"
+    return kept
+
+
+def scholar_search_adapter(query: str, top_k: int = _DEFAULT_SCHOLAR_TOP_K) -> str:
     """``ScholarSearchTool`` 的最小包装。
 
     Args:
         query: 学术搜索 query。
-        top_k: 每个 query 返回的文档数（目前内部默认每个 query 8 条）。
+        top_k: 每个 query 返回的文档数。可通过环境变量 SCHOLAR_SEARCH_TOP_K
+            设置默认值（默认 5）。模型也可在 call_tool 属性中指定。
     """
     queries = _normalize_queries(query)
     if not queries:
@@ -514,9 +537,10 @@ def scholar_search_adapter(query: str, top_k: int = 8) -> str:
     search_request_list = [{"query": q} for q in queries]
 
     tool = _get_scholar_tool()
+    prev_page_idx = _INTERNAL_STATE["page_idx"]
     out = tool(
         search_request_list=search_request_list,
-        page_idx=_INTERNAL_STATE["page_idx"],
+        page_idx=prev_page_idx,
         last_time=_INTERNAL_STATE["last_time"],
         curr_title=_INTERNAL_STATE["curr_title"],
         refid_url_map=_INTERNAL_STATE["refid_url_map"],
@@ -531,10 +555,19 @@ def scholar_search_adapter(query: str, top_k: int = 8) -> str:
         return "[ScholarSearch] empty response; check logid=" + str(
             out.get("metric", {}).get("log_id", "")
         )
+    # 截断到 top_k 个文档，并修正 page_idx 使 ID 连续
+    top_k = max(1, min(int(top_k or _DEFAULT_SCHOLAR_TOP_K), 20))
+    content = _truncate_xml_documents(content, top_k)
+    # 用截断后实际保留的文档数更新 page_idx，避免 ID 跳跃
+    actual_docs = len(re.findall(r"<document\s", content))
+    _INTERNAL_STATE["page_idx"] = prev_page_idx + actual_docs
     return content
 
 
-def general_search_adapter(query: Any, is_cot: bool = True) -> str:
+_DEFAULT_GENERAL_TOP_K = int(os.environ.get("GENERAL_SEARCH_TOP_K", "5"))
+
+
+def general_search_adapter(query: Any, top_k: int = _DEFAULT_GENERAL_TOP_K, is_cot: bool = True) -> str:
     """``GeneralSearchTool`` 的最小包装。支持 ``query`` 为 str 或 list。"""
     queries = _normalize_queries(query)
     if not queries:
@@ -542,10 +575,11 @@ def general_search_adapter(query: Any, is_cot: bool = True) -> str:
     search_request_list = [{"query": q} for q in queries]
 
     tool = _get_general_tool()
+    prev_page_idx = _INTERNAL_STATE["page_idx"]
     out = tool(
         is_cot=bool(is_cot),
         search_request_list=search_request_list,
-        page_idx=_INTERNAL_STATE["page_idx"],
+        page_idx=prev_page_idx,
         last_time=_INTERNAL_STATE["last_time"],
         curr_title=_INTERNAL_STATE["curr_title"],
         refid_url_map=_INTERNAL_STATE["refid_url_map"],
@@ -560,6 +594,12 @@ def general_search_adapter(query: Any, is_cot: bool = True) -> str:
         return "[GeneralSearch] empty response; check logid=" + str(
             out.get("metric", {}).get("log_id", "")
         )
+    # 截断到 top_k 个文档，并修正 page_idx 使 ID 连续
+    top_k = max(1, min(int(top_k or _DEFAULT_GENERAL_TOP_K), 20))
+    content = _truncate_xml_documents(content, top_k)
+    # 用截断后实际保留的文档数更新 page_idx，避免 ID 跳跃
+    actual_docs = len(re.findall(r"<document\s", content))
+    _INTERNAL_STATE["page_idx"] = prev_page_idx + actual_docs
     return content
 
 

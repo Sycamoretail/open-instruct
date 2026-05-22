@@ -47,15 +47,15 @@ fi
 # --------------------------------------------------
 # Config
 # --------------------------------------------------
-EXP_NAME="${EXP_NAME:=qwen3_8b_scholar_sft_3}"
+EXP_NAME="${EXP_NAME:=qwen3_8b_scholar_sft_v4}"
 BASE_MODEL_NAME_OR_PATH="${BASE_MODEL_NAME_OR_PATH:=/mlx_devbox/users/luoyunze/playground/open-instruct/models/Qwen3-8B}"
-SFT_DATA_PATH="${SFT_DATA_PATH:=${REPO_ROOT}/data/scholar/sft_distill_full.jsonl}"
+SFT_DATA_PATH="${SFT_DATA_PATH:=${REPO_ROOT}/data/scholar/sft_distill_v4.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:=${REPO_ROOT}/outputs/${EXP_NAME}}"
 PREPARED_SFT_DATA_PATH="${PREPARED_SFT_DATA_PATH:=${OUTPUT_DIR}/sft_messages_only.jsonl}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:=configs/ds_configs/stage3_no_offloading_accelerate.conf}"
 
 NUM_PROCESSES="${NUM_PROCESSES:=8}"
-MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:=16384}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:=24576}"
 LEARNING_RATE="${LEARNING_RATE:=5e-6}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:=20}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:=1}"

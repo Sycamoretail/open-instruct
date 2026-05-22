@@ -11,6 +11,7 @@ Examples:
     python evaluate_results.py browsecomp eval_output/baselines-20250828/sft_search_generate/browsecomp-ablation.jsonl
     python evaluate_results.py healthbench eval_output/baselines-20250828/sft_search_generate/healthbench-ablation.jsonl
 """
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,11 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 if str(SCRIPT_ROOT / "evaluation") not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT / "evaluation"))
+
+# Add open_instruct to path for scholar_evaluator imports
+_REPO_ROOT = SCRIPT_ROOT.parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import argparse
 import json
@@ -41,6 +47,20 @@ from evaluation.short_form_qa_eval.short_form_eval import ShortFormQAEval
 from evaluation.simple_qa_eval.simpleqa_eval import SimpleQAEval
 
 load_dotenv()
+
+_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+
+
+def _clean_scholar_response(raw_response: str) -> str:
+    """Extract <answer> block and convert <cite> tags to [N] format for evaluation."""
+    from open_instruct.scholar_evaluator import clean_rich_media_reference
+
+    # Extract <answer> block if present; otherwise use full response
+    match = _ANSWER_RE.search(raw_response or "")
+    text = match.group(1).strip() if match else (raw_response or "")
+    # Convert <cite id="N">text</cite> -> text[N]
+    cleaned = clean_rich_media_reference(text)
+    return cleaned
 
 
 def load_jsonl(file_path):
@@ -89,7 +109,7 @@ def evaluate_researchqa(
     original_examples = load_jsonl(file_path)
     response_map = {
         ele["original_data"]["orig_id"]: {
-            "answer": ele["final_response"],
+            "answer": _clean_scholar_response(ele["final_response"]),
         }
         for ele in original_examples
     }
@@ -324,6 +344,23 @@ def main():
         if args.save_path:
             cmd.extend(["--output_dir", args.save_path])
         print(f"Running DRB evaluation: {' '.join(cmd)}")
+        subprocess.run(cmd)
+    elif args.task in ("deepscholar_bench", "deep_scholar_bench"):
+        # DeepScholar-Bench evaluation (reference_coverage + cite_p + nugget_coverage)
+        import subprocess
+        ds_script = str(Path(__file__).parent / "evaluation" / "deepscholar_bench_eval" / "run_eval.py")
+        task_name = Path(args.file_path).stem
+        dataset_dir = str(_REPO_ROOT / "deepscholar" / "dataset")
+        cmd = [
+            sys.executable, ds_script,
+            "--input_file", args.file_path,
+            "--task_name", task_name,
+            "--grader_model", args.grader_model,
+            "--dataset_dir", dataset_dir,
+        ]
+        if args.save_path:
+            cmd.extend(["--output_dir", args.save_path])
+        print(f"Running DeepScholar-Bench evaluation: {' '.join(cmd)}")
         subprocess.run(cmd)
     elif args.task == "sqa_cs_v2":
         # Self-contained SQA evaluation

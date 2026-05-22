@@ -304,16 +304,40 @@ def load_healthbench_data(
     return examples
 
 
+_DEEP_SCHOLAR_QUERY_TEMPLATE = (
+    "Your task is to write a Related Works section for an academic paper given "
+    "the paper's abstract. Your response should provide the Related Works section "
+    "and references. Only include references from arXiv that are published before "
+    "{cutoff_date}. Mention them in a separate, numbered reference list at the end "
+    "and use the reference numbers to provide in-line citations in the Related Works "
+    "section for all claims referring to a source (e.g., description of source [3]. "
+    "Further details [6][7][8][9][10].) Each in-line citation must consist of a "
+    "single reference number within a pair of brackets. Do not use any other "
+    "citation format. Do not exceed 600 words for the related works section. "
+    "Here is the paper abstract:\n{abstract}"
+)
+
+
 def load_deep_scholar_bench_data(num_examples: Optional[int] = None) -> List[Dict]:
-    """Load Deep Scholar Bench dataset data."""
-    raw_data = datasets.load_dataset("xinranz3/deepscholar_bench_fixed", "default")
+    """Load Deep Scholar Bench dataset from local deepscholar/dataset/ directory."""
+    # Resolve dataset path relative to the repo root.
+    _this_dir = Path(__file__).resolve().parent
+    _repo_root = _this_dir.parents[3]  # scripts/eval/dr_tulu/dataset_utils -> repo root
+    dataset_csv = _repo_root / "deepscholar" / "dataset" / "papers_with_related_works.csv"
+
+    df = pd.read_csv(dataset_csv)
 
     examples = []
-    for sample in raw_data["train"]:
+    for idx, row in df.iterrows():
+        query = _DEEP_SCHOLAR_QUERY_TEMPLATE.format(
+            cutoff_date=row["published_date"],
+            abstract=row["abstract"],
+        )
         examples.append(
             {
-                "id": sample["qid"],
-                "problem": sample["query"],
+                "id": hashlib.md5(query.encode()).hexdigest(),
+                "orig_id": str(idx),
+                "problem": query,
                 "additional_instructions": "",
             }
         )

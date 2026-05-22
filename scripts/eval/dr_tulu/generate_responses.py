@@ -116,7 +116,7 @@ Every action MUST be wrapped in the exact XML tags shown below:
      Produce the final response and stop. Exactly one <answer> block may
      appear; everything after </answer> is ignored.
 
-  4. <cite id="SOURCE_ID"></cite>
+  4. <cite id="SOURCE_ID">supported claim</cite>
      Used INSIDE <answer> to wrap claims in citation tags that point to
      the supporting source. SOURCE_ID must be the numeric part of a
      document's reference_id returned by a previous tool call. Prefer
@@ -131,14 +131,14 @@ Output format rules:
   - After a <call_tool>, stop; the environment will reply with a
     <tool_response>...</tool_response> message. Use it to plan the next
     action.
-  - Inside <answer>, back every factual claim with <cite id="N"></cite>
+  - Inside <answer>, wrap every factual claim with <cite id="N">claim text</cite>
     where N is a reference_id returned by one of your tool calls. Do not
     invent reference IDs.
   - Do NOT use plain-text citation styles such as [1], [1][2], (1),
     superscripts, footnotes, or a bibliography section.
-  - Put citations directly in XML form after the supported claim, e.g.
-    ... sentence.<cite id="3"></cite> or
-    ... sentence.<cite id="3"></cite><cite id="7"></cite>
+  - Put citations directly in XML form wrapping the supported claim, e.g.
+    <cite id="3">some factual claim</cite> or
+    <cite id="3">claim A</cite><cite id="7">claim B</cite>
 """
 
 
@@ -354,12 +354,13 @@ def parse_args() -> argparse.Namespace:
             "Do not call any tools again. Based only on the evidence already returned above, "
             "write the final answer now. Your response MUST contain exactly one "
             "<think>...</think> block followed by exactly one <answer>...</answer> block. "
-            "Inside <answer>, cite supporting evidence with <cite id=\"SOURCE_ID\"></cite> "
+            'Inside <answer>, cite supporting evidence with <cite id="SOURCE_ID">claim text</cite> '
             "using only source IDs that appeared in the previous tool responses. "
             "Do NOT use bracket citations like [1], [1][2], superscripts, footnotes, or a References section. "
-            "Every factual sentence in <answer> must end with one or more empty citation tags such as "
-            "<cite id=\"12\"></cite> or <cite id=\"12\"></cite><cite id=\"18\"></cite>. "
-            "The citation tag itself must stay exactly in XML form; do not replace it with plain-text numbers. "
+            "Every factual claim in <answer> must be wrapped inside a citation tag, for example "
+            '<cite id="12">some factual claim</cite> or '
+            '<cite id="12">claim A</cite><cite id="18">claim B</cite>. '
+            "The citation tag must wrap the supported text, not be empty. "
             "If the evidence is incomplete, state the uncertainty instead of searching again."
         ),
         help="User message appended before the forced final-answer call.",
@@ -403,17 +404,38 @@ def build_messages(
     return messages
 
 
+def _sanitize_thinking_artifacts(text: str) -> str:
+    """Fix Qwen3 thinking-mode artifacts like <think>> or <think> >."""
+    # <think>> → <think>
+    text = re.sub(r"<think>\s*>", "<think>", text)
+    return text
+
+
 def extract_response_text(response_json: dict[str, Any]) -> tuple[str, str]:
-    """Return (content_text, finish_reason) from a chat/completions response."""
+    """Return (content_text, finish_reason) from a chat/completions response.
+
+    If the vLLM server has --enable-thinking, the model's <think>...</think>
+    block is stripped from ``content`` and placed in ``reasoning_content``.
+    We recombine them so that our XML protocol is preserved.
+    """
     choices = response_json.get("choices") or []
     if not choices:
         raise ValueError(f"Missing choices in response: {response_json}")
     choice = choices[0]
     finish_reason = str(choice.get("finish_reason") or "")
     message = choice.get("message", {})
+
+    # Recombine reasoning_content (if vLLM stripped <think>) with content.
+    reasoning = message.get("reasoning_content") or ""
     content = message.get("content")
+
+    def _build(text: str) -> str:
+        if reasoning:
+            text = f"<think>\n{reasoning}\n</think>\n{text}"
+        return _sanitize_thinking_artifacts(text)
+
     if isinstance(content, str):
-        return content, finish_reason
+        return _build(content), finish_reason
     if isinstance(content, list):
         text_chunks = []
         for item in content:
@@ -421,7 +443,7 @@ def extract_response_text(response_json: dict[str, Any]) -> tuple[str, str]:
                 text_chunks.append(item.get("text", ""))
         text = "".join(text_chunks).strip()
         if text:
-            return text, finish_reason
+            return _build(text), finish_reason
     raise ValueError(f"Unsupported message content in response: {response_json}")
 
 
@@ -447,6 +469,11 @@ def call_llm(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        # NOTE: Do NOT set chat_template_kwargs.enable_thinking=False here.
+        # That pre-fills an empty <think></think> in the prompt, causing the model
+        # to skip its own <think> reasoning.  Instead, we keep the default
+        # (enable_thinking=True) and handle the thinking-mode output in
+        # extract_response_text by recombining reasoning_content + content.
     }
     if top_p is not None:
         payload["top_p"] = top_p
@@ -613,21 +640,13 @@ def run_internal_agent(
         tool_records = parse_internal_tool_output(tool_raw) if ok else []
         drb_text = records_to_drb_block(tool_records) if tool_records else ""
 
-        # DRB FACT maps citations via "{call_id}-{i}" keys. Rewrite the
-        # reference_ids in the <tool_response> that goes back to the model,
-        # so when the model emits <cite id="..."> it matches the traces
-        # dictionary built by ``format_drb_data``.
-        rewritten_raw = tool_raw
-        for idx, rec in enumerate(tool_records):
-            orig = rec.get("reference_id") or ""
-            if not orig:
-                continue
-            new_id = f"{call_id}-{idx}"
-            rewritten_raw = rewritten_raw.replace(orig, new_id)
-
+        # Keep original reference_ids (e.g. ``<|superscript|>:N``) in the
+        # tool response shown to the model so its <cite id="N"> matches the
+        # IDs the RL training environment uses.  The tool_outputs dict still
+        # stores a ``call_id``-based key for DRB FACT compatibility.
         tool_outputs = [
             {
-                "reference_id": f"{call_id}-{idx}",
+                "reference_id": rec.get("reference_id") or f"{call_id}-{idx}",
                 "title": rec.get("Title", ""),
                 "url": rec.get("URL", ""),
                 "snippet": rec.get("Snippet", ""),
@@ -656,7 +675,7 @@ def run_internal_agent(
             }
         )
 
-        model_tool_raw = rewritten_raw
+        model_tool_raw = tool_raw
         if max_tool_response_chars > 0 and len(model_tool_raw) > max_tool_response_chars:
             omitted = len(model_tool_raw) - max_tool_response_chars
             model_tool_raw = (

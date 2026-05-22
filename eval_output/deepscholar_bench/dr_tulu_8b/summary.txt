@@ -1,0 +1,6 @@
+reference_coverage: 0.0367
+cite_p: 0.3879
+nugget_coverage: 0.2017
+organization: 0.0000
+claim_coverage: 0.4696
+coverage_relevance_rate: 0.5564
