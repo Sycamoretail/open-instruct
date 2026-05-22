@@ -17,7 +17,7 @@ oe-eval-internal/
 results
 models
 wandb
-data/*
+
 # !data/processed
 output/
 outputs/
